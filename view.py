@@ -1,3 +1,38 @@
+#!/usr/bin/env python3
+"""
+visualize_case.py -- Inspect one CT + aorta-mask pair from the aortic-branch challenge.
+
+Usage
+-----
+    python visualize_case.py --image orig1.nii --aorta-mask mask1.nii --outdir viz/
+
+    # add an interactive scroll-through-slices window:
+    python visualize_case.py --image orig1.nii --aorta-mask mask1.nii --interactive
+
+What it produces (PNGs in --outdir, plus a printed header report):
+
+  00_report.txt        geometry / intensity / mask stats
+  01_ortho.png         axial, coronal, sagittal through the aorta centroid, mask overlaid
+  02_axial_montage.png evenly spaced axial slices spanning the aortic segment
+  03_mip.png           coronal + sagittal maximum-intensity projections -- the single
+                       best view for *seeing* the daughter branches
+  06_intensity_render.png  is the lumen HU band alone enough to isolate the arteries?
+
+All figures show the FULL field of view by default. Pass --crop to restrict them
+to a margin around the aorta (tighter, but you lose surrounding context).
+  04_aorta_3d.png      marching-cubes surface of the supplied aorta mask
+  05_wall_shell.png    mean CT intensity in a thin shell just outside the aortic wall,
+                       unrolled as angle-vs-z -- branch ostia show up as bright blobs
+
+Dependencies
+------------
+    pip install SimpleITK numpy matplotlib scikit-image scipy
+
+Coordinate note: SimpleITK arrays are indexed [z, y, x]; physical points are
+(x, y, z) via TransformIndexToPhysicalPoint. Every millimetre figure printed here
+goes through that transform, never raw index arithmetic.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -109,8 +144,14 @@ def window(slab: np.ndarray, level: float = CTA_LEVEL, width: float = CTA_WIDTH)
     return np.clip((slab - lo) / (hi - lo), 0.0, 1.0)
 
 
-def mask_bbox(mk: np.ndarray, pad_vox=(0, 0, 0)):
-    """Return slices bounding the mask, padded and clipped."""
+def mask_bbox(mk: np.ndarray, pad_vox=(0, 0, 0), crop: bool = True):
+    """Return slices bounding the mask, padded and clipped.
+
+    crop=False returns the full volume -- every figure then shows the whole
+    field of view, which is the default behaviour of this script.
+    """
+    if not crop:
+        return tuple(slice(0, s) for s in mk.shape)
     idx = np.where(mk > 0)
     if len(idx[0]) == 0:
         return tuple(slice(0, s) for s in mk.shape)
@@ -157,8 +198,9 @@ def fig_ortho(ct, mk, spacing, out_png, case_id):
     plt.close(fig)
 
 
-def fig_axial_montage(ct, mk, spacing, out_png, case_id, n_panels=24, margin_mm=35.0):
-    """Evenly spaced axial slices spanning the aortic segment, cropped around it."""
+def fig_axial_montage(ct, mk, spacing, out_png, case_id, n_panels=24,
+                      margin_mm=35.0, crop=False):
+    """Evenly spaced axial slices spanning the aortic segment."""
     sx, sy, sz = spacing
     zs = np.where(mk.any(axis=(1, 2)))[0]
     if len(zs) == 0:
@@ -166,7 +208,7 @@ def fig_axial_montage(ct, mk, spacing, out_png, case_id, n_panels=24, margin_mm=
     z_idx = np.linspace(zs[0], zs[-1], min(n_panels, len(zs))).round().astype(int)
 
     pad = (0, int(round(margin_mm / sy)), int(round(margin_mm / sx)))
-    _, sly, slx = mask_bbox(mk, pad)
+    _, sly, slx = mask_bbox(mk, pad, crop=crop)
 
     cols = 6
     rows = int(np.ceil(len(z_idx) / cols))
@@ -192,7 +234,7 @@ def fig_axial_montage(ct, mk, spacing, out_png, case_id, n_panels=24, margin_mm=
     plt.close(fig)
 
 
-def fig_mip(ct, mk, spacing, out_png, case_id, slab_mm=45.0):
+def fig_mip(ct, mk, spacing, out_png, case_id, slab_mm=45.0, crop=False):
     """Coronal + sagittal maximum-intensity projections of a slab around the aorta.
 
     This is the view where branch anatomy becomes obvious: the celiac trunk and SMA
@@ -202,7 +244,7 @@ def fig_mip(ct, mk, spacing, out_png, case_id, slab_mm=45.0):
     if not mk.any():
         return
     pad = (0, int(round(slab_mm / sy)), int(round(slab_mm / sx)))
-    slz, sly, slx = mask_bbox(mk, pad)
+    slz, sly, slx = mask_bbox(mk, pad, crop=crop)
     sub_ct, sub_mk = ct[slz, sly, slx], mk[slz, sly, slx]
 
     cor = sub_ct.max(axis=1)          # project along y -> [z, x]
@@ -222,8 +264,10 @@ def fig_mip(ct, mk, spacing, out_png, case_id, slab_mm=45.0):
         ax.set_title(name, color="white", fontsize=12)
         ax.axis("off")
 
-    fig.suptitle(f"{case_id} — slab MIP ±{slab_mm:.0f} mm around the aorta "
-                 f"(red = parent mask outline)", color="white", fontsize=13)
+    scope = (f"slab MIP ±{slab_mm:.0f} mm around the aorta" if crop
+             else "full field-of-view MIP")
+    fig.suptitle(f"{case_id} — {scope}  (red = parent mask outline)",
+                 color="white", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130, facecolor="black")
     plt.close(fig)
@@ -277,6 +321,342 @@ def fig_aorta_3d(mk, spacing, out_png, case_id, target_vox=1.5):
 
     fig.suptitle(f"{case_id} — supplied parent aorta mask, surface render "
                  f"(bumps on the wall are branch ostia)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+def _surface(binary, spacing, target_vox, smooth=0.8):
+    """Downsample a binary volume to ~isotropic target_vox mm and marching-cube it.
+
+    Returns (verts_xyz_mm, faces) or (None, None) if the volume is empty.
+    """
+    from skimage.measure import marching_cubes
+
+    if not binary.any():
+        return None, None
+    sx, sy, sz = spacing
+    zoom = (sz / target_vox, sy / target_vox, sx / target_vox)
+    small = ndi.zoom(binary.astype(np.float32), zoom, order=1)
+    if smooth:
+        small = ndi.gaussian_filter(small, smooth)
+    if small.max() < 0.5:
+        return None, None
+    verts, faces, _, _ = marching_cubes(small, level=0.5, spacing=(target_vox,) * 3)
+    return verts[:, [2, 1, 0]], faces          # (z,y,x) -> (x,y,z)
+
+
+def fig_intensity_render(ct, mk, spacing, out_png, out_txt, case_id,
+                         k_sd=2.5, erode_mm=2.0, margin_mm=60.0,
+                         crop=False, max_components=15,
+                         min_component_mm3=30.0):
+    """EXPERIMENT: is intensity alone enough to isolate the arterial tree?
+
+    Learns the lumen HU band from inside the supplied aorta mask, thresholds the
+    whole (cropped) volume with it, and renders three surfaces side by side:
+
+      A  the supplied aorta mask                      -- what you were given
+      B  everything in the HU band                    -- what intensity alone buys
+      C  the band, restricted to what touches the aorta
+
+    Panel B is the answer to "is colour enough". Panel C is the answer to
+    "is colour plus connectivity enough", which is the actually useful question.
+    """
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    sx, sy, sz = spacing
+    vox_mm3 = sx * sy * sz
+    if not mk.any():
+        return
+
+    # --- learn the band from the eroded lumen (dodging partial-volume at the wall)
+    er_iter = max(int(round(erode_mm / min(sx, sy))), 1)
+    core = ndi.binary_erosion(mk, iterations=er_iter)
+    if core.sum() < 50:
+        core = mk.astype(bool)
+    lumen = ct[core]
+    mu, sd = float(lumen.mean()), float(lumen.std())
+    lo, hi = mu - k_sd * sd, mu + k_sd * sd
+
+    pad = (int(round(margin_mm / sz)), int(round(margin_mm / sy)),
+           int(round(margin_mm / sx)))
+    region = mask_bbox(mk, pad, crop=crop)
+    sub_ct, sub_mk = ct[region], mk[region].astype(bool)
+
+    band = (sub_ct >= lo) & (sub_ct <= hi)
+    band = ndi.binary_opening(band, iterations=1)          # drop single-voxel noise
+
+    # --- connected components, and which of them touch the aorta
+    lab, n_lab = ndi.label(band)
+    if n_lab == 0:
+        return
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+
+    touch = np.unique(lab[ndi.binary_dilation(sub_mk, iterations=1)])
+    touch = set(int(t) for t in touch if t > 0)
+    connected = np.isin(lab, list(touch)) if touch else np.zeros_like(band)
+
+    # --- text report: what else in this scan looks exactly like aortic blood?
+    min_vox = max(int(min_component_mm3 / vox_mm3), 1)
+    order = np.argsort(sizes)[::-1]
+    keep = [int(i) for i in order if sizes[i] >= min_vox][:40]
+
+    lines = [
+        "=" * 74,
+        f"INTENSITY-ONLY EXPERIMENT — {case_id}",
+        "=" * 74,
+        f"  lumen HU (eroded mask)  : mean {mu:.0f}, sd {sd:.0f}",
+        f"  band used (mean +/- {k_sd} sd) : {lo:.0f} .. {hi:.0f} HU",
+        f"  field of view           : {f'aorta bbox + {margin_mm:.0f} mm' if crop else 'whole volume'}",
+        "",
+        f"  aorta mask volume       : {sub_mk.sum() * vox_mm3 / 1000:.1f} mL",
+        f"  in-band volume          : {band.sum() * vox_mm3 / 1000:.1f} mL "
+        f"({band.sum() / max(sub_mk.sum(), 1):.1f}x the aorta)",
+        f"  ... touching the aorta  : {connected.sum() * vox_mm3 / 1000:.1f} mL",
+        f"  in-band components >{min_component_mm3:.0f} mm3 : "
+        f"{sum(1 for i in np.flatnonzero(sizes) if sizes[i] >= min_vox)}",
+        "",
+        "  largest in-band components:",
+        f"    {'rank':>4}  {'volume mL':>10}  {'mean HU':>8}  {'touches aorta':>13}",
+    ]
+    for rank, i in enumerate(keep[:15], start=1):
+        comp = lab == i
+        lines.append(f"    {rank:>4}  {sizes[i] * vox_mm3 / 1000:>10.2f}  "
+                     f"{sub_ct[comp].mean():>8.0f}  "
+                     f"{('yes' if i in touch else 'no'):>13}")
+    lines += [
+        "",
+        "  Read this as: if the in-band volume is many times the aorta volume, raw",
+        "  intensity is NOT separating arteries from bone, contrast-filled kidneys,",
+        "  bowel or veins. Compare the 'touching the aorta' figure -- if that one is",
+        "  close to the aorta volume plus a little, connectivity is doing the real",
+        "  work and a band + region-grow is a viable candidate generator.",
+        "=" * 74,
+    ]
+    report = "\n".join(lines)
+    print(report)
+    with open(out_txt, "w") as fh:
+        fh.write(report + "\n")
+
+    # --- render. Coarsen until matplotlib can actually draw it.
+    def surface_capped(binary, cap=120_000):
+        for tv in (2.0, 2.5, 3.0, 4.0, 5.0):
+            v, f = _surface(binary, spacing, tv)
+            if v is None:
+                return None, None
+            if len(f) <= cap:
+                return v, f
+        return v, f
+
+    # For the busy panel, keep only the biggest components so the figure stays legible.
+    big = np.isin(lab, keep[:max_components]) if keep else band
+    omitted = max(sum(1 for i in np.flatnonzero(sizes) if sizes[i] >= min_vox)
+                  - max_components, 0)
+
+    panels = [
+        ("A — supplied aorta mask", [(sub_mk, "#d94a4a", 0.95)]),
+        (f"B — HU band only ({lo:.0f}..{hi:.0f})\n"
+         f"largest {min(max_components, len(keep))} components"
+         + (f", {omitted} more omitted" if omitted else ""),
+         [(big & ~sub_mk, "#2f9e9e", 0.55), (sub_mk, "#d94a4a", 0.95)]),
+        ("C — HU band, connected to aorta",
+         [(connected & ~sub_mk, "#2f9e9e", 0.75), (sub_mk, "#d94a4a", 0.95)]),
+    ]
+
+    fig = plt.figure(figsize=(17, 6.5), facecolor="white")
+    for col, (title, layers) in enumerate(panels, start=1):
+        ax = fig.add_subplot(1, 3, col, projection="3d")
+        allv = []
+        for binary, color, alpha in layers:
+            v, f = surface_capped(binary)
+            if v is None:
+                continue
+            coll = Poly3DCollection(v[f], alpha=alpha)
+            coll.set_facecolor(color)
+            coll.set_edgecolor("none")
+            ax.add_collection3d(coll)
+            allv.append(v)
+        if not allv:
+            ax.set_axis_off()
+            continue
+        allv = np.vstack(allv)
+        ax.set_xlim(allv[:, 0].min(), allv[:, 0].max())
+        ax.set_ylim(allv[:, 1].min(), allv[:, 1].max())
+        ax.set_zlim(allv[:, 2].min(), allv[:, 2].max())
+        try:
+            ax.set_box_aspect([np.ptp(allv[:, k]) for k in range(3)])
+        except Exception:
+            pass
+        ax.view_init(elev=12, azim=-75)          # near-anterior, slightly tilted
+        ax.set_title(title, fontsize=10)
+        ax.set_axis_off()
+
+    fig.suptitle(f"{case_id} — can intensity alone find the branches?   "
+                 f"red = supplied aorta,  teal = everything else in the lumen HU band",
+                 fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+def lumen_band(ct, mk, k_sd=2.5, erode_mm=2.0, spacing=(1, 1, 1)):
+    """Learn the lumen HU band from inside the (eroded) aorta mask."""
+    sx, sy, sz = spacing
+    er_iter = max(int(round(erode_mm / min(sx, sy))), 1)
+    core = ndi.binary_erosion(mk, iterations=er_iter)
+    if core.sum() < 50:
+        core = mk.astype(bool)
+    lumen = ct[core]
+    mu, sd = float(lumen.mean()), float(lumen.std())
+    return mu - k_sd * sd, mu + k_sd * sd, mu, sd
+
+
+def fig_kernel_stride(ct, mk, spacing, out_png, out_txt, case_id,
+                      k_sd=2.5, ksize=3, strides=(1, 2), crop=False,
+                      margin_mm=60.0, max_components=15, min_component_mm3=30.0):
+    """EXPERIMENT: threshold on a k x k in-plane block MEAN instead of single voxels.
+
+    For every candidate block position (stepping by `stride`), take the mean of the
+    k x k neighbourhood in that axial slice. If the mean falls in the lumen HU band,
+    the whole k x k block is accepted. Stride 1 slides over every position; stride 2
+    evaluates every other position, so the result is quantised onto a coarser lattice.
+
+    Point of the test: block averaging is a low-pass filter. It kills isolated noisy
+    voxels, but it also dilutes any vessel narrower than the kernel by mixing lumen
+    with surrounding fat -- so small branches drop out of the band entirely. This
+    figure shows you that tradeoff directly.
+    """
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    sx, sy, sz = spacing
+    vox_mm3 = sx * sy * sz
+    if not mk.any():
+        return
+
+    lo, hi, mu, sd = lumen_band(ct, mk, k_sd, spacing=spacing)
+
+    pad = (int(round(margin_mm / sz)), int(round(margin_mm / sy)),
+           int(round(margin_mm / sx)))
+    region = mask_bbox(mk, pad, crop=crop)
+    sub_ct, sub_mk = ct[region], mk[region].astype(bool)
+
+    # per-voxel reference, and the k x k block mean (in-plane, per axial slice)
+    per_voxel = (sub_ct >= lo) & (sub_ct <= hi)
+    block_mean = ndi.uniform_filter(sub_ct, size=(1, ksize, ksize), mode="nearest")
+    mean_ok = (block_mean >= lo) & (block_mean <= hi)
+
+    r = ksize // 2
+    footprint = np.ones((1, ksize, ksize), bool)
+
+    results = [("per-voxel (stride 1, 1x1)", per_voxel)]
+    for s in strides:
+        centers = np.zeros_like(mean_ok)
+        centers[:, r:-r or None:s, r:-r or None:s] = \
+            mean_ok[:, r:-r or None:s, r:-r or None:s]
+        # "graph the k x k": every accepted centre paints its whole block
+        results.append((f"{ksize}x{ksize} block mean, stride {s}",
+                        ndi.binary_dilation(centers, structure=footprint)))
+
+    # ---------------- text report ----------------
+    lines = [
+        "=" * 78,
+        f"BLOCK-MEAN KERNEL EXPERIMENT — {case_id}",
+        "=" * 78,
+        f"  lumen HU band           : {lo:.0f} .. {hi:.0f}  (mean {mu:.0f}, sd {sd:.0f})",
+        f"  kernel                  : {ksize}x{ksize} in-plane "
+        f"({ksize * sx:.1f} x {ksize * sy:.1f} mm at this spacing)",
+        f"  field of view           : {f'aorta bbox + {margin_mm:.0f} mm' if crop else 'whole volume'}",
+        f"  aorta mask volume       : {sub_mk.sum() * vox_mm3 / 1000:.1f} mL",
+        "",
+        f"  {'variant':<32} {'volume mL':>10} {'components':>11} {'in aorta %':>11}",
+    ]
+    min_vox = max(int(min_component_mm3 / vox_mm3), 1)
+    for name, vol in results:
+        lab, _ = ndi.label(vol)
+        sizes = np.bincount(lab.ravel())
+        sizes[0] = 0
+        n_comp = int((sizes >= min_vox).sum())
+        recall = 100.0 * (vol & sub_mk).sum() / max(sub_mk.sum(), 1)
+        lines.append(f"  {name:<32} {vol.sum() * vox_mm3 / 1000:>10.1f} "
+                     f"{n_comp:>11d} {recall:>10.1f}%")
+    lines += [
+        "",
+        "  'in aorta %' is how much of the supplied aorta each variant recovers --",
+        "  a sanity floor. If block averaging drops it below ~95% the kernel is",
+        "  already eroding a 20 mm vessel, and a 3 mm branch has no chance.",
+        "  Watch the component count: fewer components = less speckle, but check the",
+        "  volume at the same time, because losing small vessels also drops it.",
+        "=" * 78,
+    ]
+    report = "\n".join(lines)
+    print(report)
+    with open(out_txt, "w") as fh:
+        fh.write(report + "\n")
+
+    # ---------------- pick a branch-rich axial slice for the 2D row ----------------
+    dist_out = ndi.distance_transform_edt(~sub_mk, sampling=(sz, sy, sx))
+    near = (dist_out > 0) & (dist_out < 20.0)
+    score = (per_voxel & near).sum(axis=(1, 2))
+    z_show = int(np.argmax(score)) if score.max() > 0 else sub_ct.shape[0] // 2
+
+    def surface_capped(binary, cap=120_000):
+        for tv in (2.0, 2.5, 3.0, 4.0, 5.0):
+            v, f = _surface(binary, spacing, tv)
+            if v is None or len(f) <= cap:
+                return v, f
+        return v, f
+
+    n = len(results)
+    fig = plt.figure(figsize=(5.6 * n, 10.5), facecolor="white")
+
+    for col, (name, vol) in enumerate(results):
+        # keep the render legible: biggest components only
+        lab, _ = ndi.label(vol)
+        sizes = np.bincount(lab.ravel())
+        sizes[0] = 0
+        keep = [int(i) for i in np.argsort(sizes)[::-1] if sizes[i] >= min_vox]
+        big = np.isin(lab, keep[:max_components]) if keep else vol
+
+        ax = fig.add_subplot(2, n, col + 1, projection="3d")
+        allv = []
+        for binary, color, alpha in ((big & ~sub_mk, "#2f9e9e", 0.6),
+                                     (sub_mk, "#d94a4a", 0.95)):
+            v, f = surface_capped(binary)
+            if v is None:
+                continue
+            coll = Poly3DCollection(v[f], alpha=alpha)
+            coll.set_facecolor(color)
+            coll.set_edgecolor("none")
+            ax.add_collection3d(coll)
+            allv.append(v)
+        if allv:
+            allv = np.vstack(allv)
+            ax.set_xlim(allv[:, 0].min(), allv[:, 0].max())
+            ax.set_ylim(allv[:, 1].min(), allv[:, 1].max())
+            ax.set_zlim(allv[:, 2].min(), allv[:, 2].max())
+            try:
+                ax.set_box_aspect([np.ptp(allv[:, k]) for k in range(3)])
+            except Exception:
+                pass
+        ax.view_init(elev=12, azim=-75)
+        ax.set_title(name, fontsize=11)
+        ax.set_axis_off()
+
+        # bottom row: what the acceptance map looks like on one axial slice
+        ax2 = fig.add_subplot(2, n, n + col + 1)
+        ax2.imshow(window(sub_ct[z_show]), cmap="gray", vmin=0, vmax=1, aspect=sy / sx)
+        overlay = np.zeros(sub_ct[z_show].shape + (4,), np.float32)
+        overlay[vol[z_show]] = (0.18, 0.62, 0.62, 0.55)
+        overlay[sub_mk[z_show]] = (0.85, 0.29, 0.29, 0.55)
+        ax2.imshow(overlay, aspect=sy / sx, interpolation="nearest")
+        ax2.set_title(f"axial slice {z_show}", fontsize=10)
+        ax2.axis("off")
+
+    fig.suptitle(
+        f"{case_id} — block-mean thresholding, kernel {ksize}x{ksize}, band {lo:.0f}-{hi:.0f} HU\n"
+        f"red = supplied aorta,  teal = accepted as lumen-like",
+        fontsize=13)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130, facecolor="white")
     plt.close(fig)
@@ -343,13 +723,13 @@ def fig_wall_shell(ct, mk, spacing, out_png, case_id, shell_mm=(1.5, 5.0)):
 # interactive scroller
 # -----------------------------------------------------------------------------
 
-def interactive_viewer(ct, mk, spacing, case_id, margin_mm=40.0):
+def interactive_viewer(ct, mk, spacing, case_id, margin_mm=40.0, crop=False):
     """Scroll axial slices with the mouse wheel / arrow keys / slider."""
     from matplotlib.widgets import Slider
 
     sx, sy, sz = spacing
     pad = (0, int(round(margin_mm / sy)), int(round(margin_mm / sx)))
-    _, sly, slx = mask_bbox(mk, pad)
+    _, sly, slx = mask_bbox(mk, pad, crop=crop)
     zs = np.where(mk.any(axis=(1, 2)))[0]
     z_lo, z_hi = (int(zs[0]), int(zs[-1])) if len(zs) else (0, ct.shape[0] - 1)
 
@@ -416,7 +796,15 @@ def main():
     ap.add_argument("--case-id", default=None, help="label for the figures")
     ap.add_argument("--interactive", action="store_true",
                     help="open a scrollable axial viewer instead of only saving PNGs")
-    ap.add_argument("--skip-3d", action="store_true", help="skip the surface render")
+    ap.add_argument("--skip-3d", action="store_true", help="skip the surface renders")
+    ap.add_argument("--hu-sd", type=float, default=2.5,
+                    help="width of the lumen HU band for fig 06, in std devs "
+                         "of the intensity inside the aorta (default 2.5)")
+    ap.add_argument("--kernel", type=int, default=3,
+                    help="in-plane block size for fig 07 (default 3 -> 3x3)")
+    ap.add_argument("--crop", action="store_true",
+                    help="crop every figure to a margin around the aorta. "
+                         "OFF by default -- figures show the whole field of view.")
     args = ap.parse_args()
 
     if not args.interactive:
@@ -436,13 +824,26 @@ def main():
 
     jobs = [
         ("01_ortho.png",         lambda p: fig_ortho(ct, mk, spacing, p, case_id)),
-        ("02_axial_montage.png", lambda p: fig_axial_montage(ct, mk, spacing, p, case_id)),
-        ("03_mip.png",           lambda p: fig_mip(ct, mk, spacing, p, case_id)),
+        ("02_axial_montage.png", lambda p: fig_axial_montage(ct, mk, spacing, p,
+                                                             case_id, crop=args.crop)),
+        ("03_mip.png",           lambda p: fig_mip(ct, mk, spacing, p, case_id,
+                                                   crop=args.crop)),
         ("05_wall_shell.png",    lambda p: fig_wall_shell(ct, mk, spacing, p, case_id)),
     ]
     if not args.skip_3d:
         jobs.insert(3, ("04_aorta_3d.png",
                         lambda p: fig_aorta_3d(mk, spacing, p, case_id)))
+        jobs.append(("06_intensity_render.png",
+                     lambda p: fig_intensity_render(
+                         ct, mk, spacing, p,
+                         os.path.join(args.outdir, "06_intensity_report.txt"),
+                         case_id, k_sd=args.hu_sd, crop=args.crop)))
+        jobs.append(("07_kernel_stride.png",
+                     lambda p: fig_kernel_stride(
+                         ct, mk, spacing, p,
+                         os.path.join(args.outdir, "07_kernel_report.txt"),
+                         case_id, k_sd=args.hu_sd, ksize=args.kernel,
+                         crop=args.crop)))
 
     for name, fn in jobs:
         path = os.path.join(args.outdir, name)
@@ -453,9 +854,8 @@ def main():
             print(f"  FAILED {name}: {exc}", file=sys.stderr)
 
     if args.interactive:
-        interactive_viewer(ct, mk, spacing, case_id)
+        interactive_viewer(ct, mk, spacing, case_id, crop=args.crop)
 
 
 if __name__ == "__main__":
-     main()
-
+    main()
