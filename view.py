@@ -326,6 +326,45 @@ def fig_aorta_3d(mk, spacing, out_png, case_id, target_vox=1.5):
     plt.close(fig)
 
 
+def fig_aorta_3d_interactive(mk, spacing, out_html, case_id, target_vox=1.5):
+    """Write a browser-based interactive 3D surface of the supplied mask."""
+    try:
+        import plotly.graph_objects as go
+        from skimage.measure import marching_cubes
+    except ImportError:
+        print("plotly or scikit-image not installed -- skipping interactive 3D", file=sys.stderr)
+        return
+    if not mk.any():
+        return
+
+    sx, sy, sz = spacing
+    zoom = (sz / target_vox, sy / target_vox, sx / target_vox)
+    small = ndi.zoom(mk.astype(np.float32), zoom, order=1)
+    small = ndi.gaussian_filter(small, 0.8)
+    if small.max() < 0.5:
+        return
+
+    verts, faces, _, _ = marching_cubes(small, level=0.5,
+                                        spacing=(target_vox,) * 3)
+    verts = verts[:, [2, 1, 0]]
+    mesh = go.Mesh3d(
+        x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+        color="#d94a4a", opacity=0.9, flatshading=False,
+        hoverinfo="skip",
+    )
+    fig = go.Figure(mesh)
+    fig.update_layout(
+        title=f"{case_id} - interactive aorta surface",
+        scene=dict(
+            xaxis_visible=False, yaxis_visible=False, zaxis_visible=False,
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, t=45, b=0),
+    )
+    fig.write_html(out_html, include_plotlyjs=True, full_html=True)
+
+
 def _surface(binary, spacing, target_vox, smooth=0.8):
     """Downsample a binary volume to ~isotropic target_vox mm and marching-cube it.
 
@@ -344,6 +383,134 @@ def _surface(binary, spacing, target_vox, smooth=0.8):
         return None, None
     verts, faces, _, _ = marching_cubes(small, level=0.5, spacing=(target_vox,) * 3)
     return verts[:, [2, 1, 0]], faces          # (z,y,x) -> (x,y,z)
+
+
+def _write_interactive_layers(layers, out_html, title):
+    """Write named groups of 3D surface layers with a Plotly selector."""
+    import plotly.graph_objects as go
+
+    traces = []
+    groups = []
+    for group_name, group_layers in layers:
+        groups.append((group_name, group_layers))
+
+    # Each layer stores the precomputed mesh so the selector only changes visibility.
+    for group_name, group_layers in groups:
+        for verts, faces, color, opacity in group_layers:
+            traces.append(go.Mesh3d(
+                x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                color=color, opacity=opacity, hoverinfo="skip", visible=False,
+                name=group_name,
+            ))
+
+    buttons = []
+    offset = 0
+    for group_name, group_layers in groups:
+        visible = [False] * len(traces)
+        for index in range(len(group_layers)):
+            visible[offset + index] = True
+        buttons.append(dict(label=group_name, method="update",
+                            args=[{"visible": visible}, {"title": f"{title} - {group_name}"}]))
+        offset += len(group_layers)
+    if traces:
+        traces[0].visible = True
+        initial = groups[0][0]
+    else:
+        initial = title
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"{title} - {initial}",
+        updatemenus=[dict(buttons=buttons, direction="down", x=0.02, y=0.98,
+                          xanchor="left", yanchor="top")],
+        scene=dict(xaxis_visible=False, yaxis_visible=False, zaxis_visible=False,
+                   aspectmode="data"),
+        margin=dict(l=0, r=0, t=70, b=0),
+    )
+    fig.write_html(out_html, include_plotlyjs=True, full_html=True)
+
+
+def _mesh_layers(layer_groups, spacing, target_vox=3.0):
+    meshes = []
+    for group_name, binary_layers in layer_groups:
+        group = []
+        for binary, color, opacity in binary_layers:
+            verts, faces = _surface(binary, spacing, target_vox)
+            if verts is not None:
+                group.append((verts, faces, color, opacity))
+        meshes.append((group_name, group))
+    return meshes
+
+
+def fig_intensity_interactive(ct, mk, spacing, out_html, case_id,
+                              k_sd=2.5, erode_mm=2.0, margin_mm=60.0,
+                              crop=False, max_components=15, min_component_mm3=30.0):
+    """Write an interactive version of the intensity-only 3D experiment."""
+    sx, sy, sz = spacing
+    vox_mm3 = sx * sy * sz
+    if not mk.any():
+        return
+    lo, hi, _, _ = lumen_band(ct, mk, k_sd, erode_mm, spacing)
+    pad = (int(round(margin_mm / sz)), int(round(margin_mm / sy)),
+           int(round(margin_mm / sx)))
+    region = mask_bbox(mk, pad, crop=crop)
+    sub_ct, sub_mk = ct[region], mk[region].astype(bool)
+    band = ndi.binary_opening((sub_ct >= lo) & (sub_ct <= hi), iterations=1)
+    lab, n_lab = ndi.label(band)
+    if n_lab == 0:
+        return
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    min_vox = max(int(min_component_mm3 / vox_mm3), 1)
+    keep = [int(i) for i in np.argsort(sizes)[::-1]
+            if sizes[i] >= min_vox][:max_components]
+    big = np.isin(lab, keep) if keep else band
+    touch = set(int(i) for i in np.unique(lab[ndi.binary_dilation(sub_mk, iterations=1)]) if i > 0)
+    connected = np.isin(lab, list(touch)) if touch else np.zeros_like(band)
+    layers = _mesh_layers([
+        ("A - supplied aorta mask", [(sub_mk, "#d94a4a", 0.95)]),
+        ("B - HU band candidates", [(big & ~sub_mk, "#2f9e9e", 0.55),
+                                     (sub_mk, "#d94a4a", 0.95)]),
+        ("C - connected to aorta", [(connected & ~sub_mk, "#2f9e9e", 0.75),
+                                     (sub_mk, "#d94a4a", 0.95)]),
+    ], spacing)
+    _write_interactive_layers(layers, out_html,
+                              f"{case_id} - intensity-only experiment ({lo:.0f}-{hi:.0f} HU)")
+
+
+def fig_kernel_interactive(ct, mk, spacing, out_html, case_id,
+                           k_sd=2.5, ksize=3, strides=(1, 2), crop=False):
+    """Write an interactive version of the block-mean kernel 3D experiment."""
+    sx, sy, sz = spacing
+    if not mk.any():
+        return
+    lo, hi, _, _ = lumen_band(ct, mk, k_sd, spacing=spacing)
+    pad = (int(round(60.0 / sz)), int(round(60.0 / sy)), int(round(60.0 / sx)))
+    region = mask_bbox(mk, pad, crop=crop)
+    sub_ct, sub_mk = ct[region], mk[region].astype(bool)
+    per_voxel = (sub_ct >= lo) & (sub_ct <= hi)
+    mean_ok = (ndi.uniform_filter(sub_ct, size=(1, ksize, ksize), mode="nearest") >= lo) & \
+              (ndi.uniform_filter(sub_ct, size=(1, ksize, ksize), mode="nearest") <= hi)
+    r = ksize // 2
+    footprint = np.ones((1, ksize, ksize), bool)
+    results = [("per-voxel (stride 1, 1x1)", per_voxel)]
+    for stride in strides:
+        centers = np.zeros_like(mean_ok)
+        centers[:, r:-r or None:stride, r:-r or None:stride] = \
+            mean_ok[:, r:-r or None:stride, r:-r or None:stride]
+        results.append((f"{ksize}x{ksize} block mean, stride {stride}",
+                        ndi.binary_dilation(centers, structure=footprint)))
+    groups = []
+    for name, volume in results:
+        lab, _ = ndi.label(volume)
+        sizes = np.bincount(lab.ravel())
+        sizes[0] = 0
+        keep = [int(i) for i in np.argsort(sizes)[::-1] if sizes[i] >= 30][:15]
+        big = np.isin(lab, keep) if keep else volume
+        groups.append((name, [(big & ~sub_mk, "#2f9e9e", 0.6),
+                              (sub_mk, "#d94a4a", 0.95)]))
+    _write_interactive_layers(_mesh_layers(groups, spacing), out_html,
+                              f"{case_id} - block-mean kernel experiment")
 
 
 def fig_intensity_render(ct, mk, spacing, out_png, out_txt, case_id,
@@ -795,7 +962,7 @@ def main():
     ap.add_argument("--outdir", default="viz", help="where to write PNGs")
     ap.add_argument("--case-id", default=None, help="label for the figures")
     ap.add_argument("--interactive", action="store_true",
-                    help="open a scrollable axial viewer instead of only saving PNGs")
+                    help="open the axial viewer and write an interactive 3D HTML model")
     ap.add_argument("--skip-3d", action="store_true", help="skip the surface renders")
     ap.add_argument("--hu-sd", type=float, default=2.5,
                     help="width of the lumen HU band for fig 06, in std devs "
@@ -854,6 +1021,19 @@ def main():
             print(f"  FAILED {name}: {exc}", file=sys.stderr)
 
     if args.interactive:
+        interactive_3d_path = os.path.join(args.outdir, "04_aorta_3d.html")
+        fig_aorta_3d_interactive(mk, spacing, interactive_3d_path, case_id)
+        print(f"  wrote {interactive_3d_path}")
+        if not args.skip_3d:
+            intensity_path = os.path.join(args.outdir, "06_intensity_render.html")
+            fig_intensity_interactive(ct, mk, spacing, intensity_path, case_id,
+                                      k_sd=args.hu_sd, crop=args.crop)
+            print(f"  wrote {intensity_path}")
+            kernel_path = os.path.join(args.outdir, "07_kernel_stride.html")
+            fig_kernel_interactive(ct, mk, spacing, kernel_path, case_id,
+                                   k_sd=args.hu_sd, ksize=args.kernel,
+                                   crop=args.crop)
+            print(f"  wrote {kernel_path}")
         interactive_viewer(ct, mk, spacing, case_id, crop=args.crop)
 
 
