@@ -516,7 +516,7 @@ def fig_kernel_interactive(ct, mk, spacing, out_html, case_id,
 def fig_intensity_render(ct, mk, spacing, out_png, out_txt, case_id,
                          k_sd=2.5, erode_mm=2.0, margin_mm=60.0,
                          crop=False, max_components=15,
-                         min_component_mm3=30.0):
+                         min_component_mm3=30.0, show=False):
     """EXPERIMENT: is intensity alone enough to isolate the arterial tree?
 
     Learns the lumen HU band from inside the supplied aorta mask, thresholds the
@@ -664,7 +664,8 @@ def fig_intensity_render(ct, mk, spacing, out_png, out_txt, case_id,
                  fontsize=12)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130, facecolor="white")
-    plt.close(fig)
+    if not show:
+        plt.close(fig)
 
 
 def lumen_band(ct, mk, k_sd=2.5, erode_mm=2.0, spacing=(1, 1, 1)):
@@ -681,7 +682,8 @@ def lumen_band(ct, mk, k_sd=2.5, erode_mm=2.0, spacing=(1, 1, 1)):
 
 def fig_kernel_stride(ct, mk, spacing, out_png, out_txt, case_id,
                       k_sd=2.5, ksize=3, strides=(1, 2), crop=False,
-                      margin_mm=60.0, max_components=15, min_component_mm3=30.0):
+                      margin_mm=60.0, max_components=15, min_component_mm3=30.0,
+                      show=False):
     """EXPERIMENT: threshold on a k x k in-plane block MEAN instead of single voxels.
 
     For every candidate block position (stepping by `stride`), take the mean of the
@@ -826,7 +828,8 @@ def fig_kernel_stride(ct, mk, spacing, out_png, out_txt, case_id,
         fontsize=13)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130, facecolor="white")
-    plt.close(fig)
+    if not show:
+        plt.close(fig)
 
 
 def fig_wall_shell(ct, mk, spacing, out_png, case_id, shell_mm=(1.5, 5.0)):
@@ -1021,19 +1024,18 @@ def main():
             print(f"  FAILED {name}: {exc}", file=sys.stderr)
 
     if args.interactive:
-        interactive_3d_path = os.path.join(args.outdir, "04_aorta_3d.html")
-        fig_aorta_3d_interactive(mk, spacing, interactive_3d_path, case_id)
-        print(f"  wrote {interactive_3d_path}")
         if not args.skip_3d:
-            intensity_path = os.path.join(args.outdir, "06_intensity_render.html")
-            fig_intensity_interactive(ct, mk, spacing, intensity_path, case_id,
-                                      k_sd=args.hu_sd, crop=args.crop)
-            print(f"  wrote {intensity_path}")
-            kernel_path = os.path.join(args.outdir, "07_kernel_stride.html")
-            fig_kernel_interactive(ct, mk, spacing, kernel_path, case_id,
-                                   k_sd=args.hu_sd, ksize=args.kernel,
-                                   crop=args.crop)
-            print(f"  wrote {kernel_path}")
+            fig_intensity_render(
+                ct, mk, spacing,
+                os.path.join(args.outdir, "06_intensity_render.png"),
+                os.path.join(args.outdir, "06_intensity_report.txt"),
+                case_id, k_sd=args.hu_sd, crop=args.crop, show=True)
+            fig_kernel_stride(
+                ct, mk, spacing,
+                os.path.join(args.outdir, "07_kernel_stride.png"),
+                os.path.join(args.outdir, "07_kernel_report.txt"),
+                case_id, k_sd=args.hu_sd, ksize=args.kernel,
+                crop=args.crop, show=True)
         interactive_viewer(ct, mk, spacing, case_id, crop=args.crop)
 
 
