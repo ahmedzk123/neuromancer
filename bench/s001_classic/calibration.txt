@@ -1,0 +1,10 @@
+subject001
+voxel            : 0.78 x 0.78 x 0.80 mm  (0.489 mm3)
+lumen            : 303 HU, spread 21   (mean 302 +/- 22)
+rim offset       : 0.00 mm   (classic: no rim handling)
+band             : 251 - 355 HU
+bone cut         : > 400 HU and > 2 mL
+min branch       : 8 mm3
+eligible         : must reach 0 mm beyond the wall
+leak cap         : 8.0 mL (aorta is 16.1 mL)
+despeckle        : components below min branch size are dropped (no morphological opening)

@@ -1,0 +1,8 @@
+subject001
+voxel            : 0.78 x 0.78 x 0.80 mm  (0.489 mm3)
+lumen            : 303 HU, spread 21   (mean 302 +/- 22)
+rim offset       : 0.00 mm   (mask reaches the wall, no rim to strip)
+band             : 153 - 363 HU
+bone cut         : > 365 HU and > 2 mL
+min branch       : 25 mm3
+despeckle        : components below min branch size are dropped (no morphological opening)

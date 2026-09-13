@@ -1,0 +1,9 @@
+method,n_ostia,runtime_s,note,mean_agreement_pct
+M1 frangi,0,0.27,thr=0.222,
+M2 band_connect,0,0.12,"band 414-631 HU, 1 structures",
+M3 expansion,0,0.07,"1 structures, 0.01 mL sheath removed, 1 truncated, 0 dropped",
+M4 wall_flux,0,0.0,thr 414 HU,
+M5 escape,0,0.13,"cost<8.0, 1 structures",
+M6 oof,0,0.2,thr=22.126,
+M7 bulge,0,0.01,dev > 2.0 sd (3.12 mm),
+M8 consensus,0,0.0,nothing to vote on,

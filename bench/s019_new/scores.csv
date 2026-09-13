@@ -1,0 +1,9 @@
+method,tp,fp,fn,precision,recall,f1,mean_ostium_err_mm
+M1 frangi,0,0,3,0.0,0.0,0.0,
+M2 band_connect,0,0,3,0.0,0.0,0.0,
+M3 expansion,0,0,3,0.0,0.0,0.0,
+M4 wall_flux,0,0,3,0.0,0.0,0.0,
+M5 escape,0,0,3,0.0,0.0,0.0,
+M6 oof,0,0,3,0.0,0.0,0.0,
+M7 bulge,0,0,3,0.0,0.0,0.0,
+M8 consensus,0,0,3,0.0,0.0,0.0,

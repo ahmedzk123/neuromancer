@@ -1,0 +1,9 @@
+subject001
+voxel            : 0.78 x 0.78 x 0.80 mm  (0.489 mm3)
+lumen            : 303 HU, spread 21   (mean 302 +/- 22)
+rim offset       : 1.41 mm   (blood-like fraction per shell [(0.94, 0.74), (1.41, 0.46), (1.88, 0.18)])
+band             : 153 - 363 HU
+bone cut         : > 365 HU and > 2 mL
+min branch       : 25 mm3
+leak cap         : 4.0 mL (aorta is 16.1 mL)
+despeckle        : components below min branch size are dropped (no morphological opening)
