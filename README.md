@@ -54,6 +54,58 @@ slider) instead of only saving PNGs. Add `--skip-3d` to skip the marching-cubes
 surface render, which is the slowest step and requires `scikit-image`.
 
 
+## Detecting the branches: `branch_bench.py`
+
+`view.py` only *shows* you the case. `branch_bench.py` finds the daughter
+arteries and writes the labeled `prediction.json` (`case_id` / `parent` /
+`daughters`, each vessel numbered `branch_001`, `branch_002`, ...).
+
+```bash
+python branch_bench.py \
+  --image "TORALIS CHALLENGE\subject001\orig1.nii" \
+  --aorta-mask "TORALIS CHALLENGE\subject001\mask1.nii" \
+  --outdir bench --output prediction.json --case-id subject001
+```
+
+### How it locates an ostium
+
+Ostia are found **on the aortic surface**, not inferred from a blob grown off
+it. Every boundary voxel of the supplied mask casts a cone of rays outward
+along its smoothed surface normal, and a ray survives only while it stays in
+contrast-filled lumen, out of bone, out of the parent aorta, and *genuinely
+getting further away from the aorta*. The surviving peaks are suppressed to
+one per opening, refined to sub-voxel position on the mask's `sdf = 0`
+isosurface, and then traced down the daughter's own lumen with a
+medialness-weighted minimal path to get the 5 mm seed, direction and calibre.
+
+That departure requirement is the point. The dominant false positive around an
+aorta is the one-voxel partial-volume rind on its own wall — bright, thin,
+tube-shaped and elongated for tens of mm, so intensity and shape tests cannot
+tell it from a branch. It is trivial to reject geometrically, because it never
+gets more than about a voxel clear of the wall.
+
+### Flags worth knowing
+
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `--method` | `wall` | `wall` (above), `m3` (older region growing, kept for comparison), `both` |
+| `--max-branches` | 25 | Cap on reported daughters, best score first |
+| `--lumen-floor` | 0.35 | Fuzzy-lumen membership a ray must stay above. Lower to ~0.25 to chase faint/small vessels |
+| `--min-reach-mm` | 3.5 | How far clear of the aorta a ray must end. **Below ~2 the wall rind returns** |
+| `--min-seed-dist-mm` | 1.5 | Clearance required at the traced 5 mm seed. Note `5*cos(angle)`: 2.0 already rejects takeoffs beyond ~66°, so don't raise it casually |
+| `--min-sep-mm` | 7.0 | Minimum spacing between two ostia |
+| `--lumen-hu` | auto | Override the intensity model, e.g. `300,25`, when the report warns of dense outliers (stent/calcium) |
+
+`<outdir>/<method>/ostia.csv` carries per-branch diagnostics (`score`,
+`path_mm`, `seed_clear_mm`, `tip_clear_mm`) so a detection can be judged
+without re-running, and `render.html` is a standalone rotatable 3D view of the
+aorta with the traced branches and ostium markers.
+
+There is no ground truth in the dataset, so these thresholds are set from
+anatomy and geometry rather than fitted to a score. If a scoring script turns
+up, `--min-reach-mm`, `--lumen-floor` and `--max-branches` are the three knobs
+that trade recall against precision.
+
 ## Notes
 
 to run view.py:

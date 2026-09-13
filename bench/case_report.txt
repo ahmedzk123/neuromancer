@@ -1,0 +1,9 @@
+subject001
+lumen (robust)   : 303 HU, spread 21
+band             : 251 - 355 HU
+bone cut         : > 365 HU and > 2 mL (174 mL excluded)
+search region    : 29 mL
+aorta mask       : 16.1 mL, 174 slices, 139 mm long
+crop             : (174, 145, 136)
+method           : wall
+wall scan        : lumen floor 0.35 (~176 HU), min reach 3.5 mm, min seed clearance 1.5 mm, min separation 7.0 mm
