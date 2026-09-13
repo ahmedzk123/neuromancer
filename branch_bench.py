@@ -46,7 +46,7 @@ from matplotlib.colors import ListedColormap
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-__version__ = "2026-09-13.2"
+__version__ = "2026-09-14.8"
 
 CTA_LEVEL, CTA_WIDTH = 200.0, 700.0
 MASK_CMAP = ListedColormap([(0, 0, 0, 0), (1.0, 0.25, 0.25, 0.35)])
@@ -242,15 +242,36 @@ def fine_surface(binary, spacing, cap=400_000, iso=0.40, blur_vox=0.9,
 
 
 def lumen_band(ct, mk, k_sd=2.5, erode_mm=2.0, spacing=(1, 1, 1)):
-    """Learn the lumen HU band from inside the (eroded) aorta mask."""
+    """Lumen HU model, estimated ROBUSTLY.
+
+    mean/std are wrecked by anything dense inside the mask -- a stent, calcified
+    plaque, or a mask that drifts onto bone. One such case gave mean 579, sd 97,
+    which is physically impossible for arterial blood and poisoned every
+    threshold downstream. Median and MAD ignore those outliers.
+
+    Returns (lo, hi, centre, spread, flag) -- flag is a warning string or "".
+    """
     sx, sy, sz = spacing
     er_iter = max(int(round(erode_mm / min(sx, sy))), 1)
     core = ndi.binary_erosion(mk, iterations=er_iter)
     if core.sum() < 50:
         core = mk.astype(bool)
-    lumen = ct[core]
-    mu, sd = float(lumen.mean()), float(lumen.std())
-    return mu - k_sd * sd, mu + k_sd * sd, mu, sd
+    v = ct[core]
+    mean, sd = float(v.mean()), float(v.std())
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med))) * 1.4826          # -> sd equivalent
+    spread = max(mad, 8.0)
+
+    flag = ""
+    if sd > 2.5 * spread and sd > 50:
+        flag = (f"mask contains dense outliers (mean {mean:.0f}/sd {sd:.0f} vs "
+                f"median {med:.0f}/MAD {spread:.0f}) - stent, calcium or "
+                f"misalignment. Using the robust estimate.")
+    if med > 450:
+        flag += (" | median lumen > 450 HU is very high for blood; check the "
+                 "mask actually covers the lumen.")
+    return med - k_sd * spread, med + k_sd * spread, med, spread, flag
+
 
 
 def link_to_aorta(pts_vox, dist_out, axis_mm, spacing,
@@ -334,12 +355,22 @@ def branch_roi(sub_ct, sub_mk, spacing, roi_mm, mu, sd,
     dist_out = ndi.distance_transform_edt(~sub_mk, sampling=(sz, sy, sx))
     # Never cut below plausible arterial enhancement: a bright CTA lumen can
     # reach 450 HU, so a purely relative cut would delete the vessels.
-    hi_cut = (max(400.0, mu + hi_sd * sd) if bone_floor_hu is None
+    # An intensity-only bone cut fails whenever the lumen estimate is high: the
+    # cut floats up above bone and the vertebra stays in the search region.
+    # Bone is also BIG and solid, while a daughter vessel is thin -- so require
+    # size as well, which holds no matter how bright the scan is.
+    hi_cut = (max(350.0, mu + hi_sd * sd) if bone_floor_hu is None
               else float(bone_floor_hu))
-    # Seed on cortex, then FILL: trabecular marrow sits at 200-400 HU, right in
-    # the lumen range, so thresholding alone leaves the inside of the vertebra
-    # in the ROI -- and trabeculae are a mesh of struts that Frangi scores highly.
-    bone = ndi.binary_closing(sub_ct > hi_cut, iterations=2)
+    seed = (sub_ct > hi_cut) & ~ndi.binary_dilation(sub_mk, iterations=2)
+    seed = ndi.binary_closing(seed, iterations=2)
+    lab_b, n_b = ndi.label(seed)
+    bone = np.zeros_like(seed)
+    if n_b:
+        vox_mm3 = sx * sy * sz
+        big = np.bincount(lab_b.ravel()) * vox_mm3 / 1000.0 > 2.0   # > 2 mL
+        big[0] = False
+        bone = big[lab_b]
+    # Trabecular marrow sits in the lumen HU range, so fill the cortex shell.
     bone = ndi.binary_fill_holes(bone)
     it = max(int(round(bone_dilate_mm / min(sx, sy))), 1)
     bone = ndi.binary_dilation(bone, iterations=it)
@@ -423,8 +454,10 @@ def write_interactive_html(out_html, meshes, title, subtitle="", axis_note=""):
     try:
         import plotly.graph_objects as go
     except ImportError:
-        print("  plotly not installed -- skipping the interactive HTML "
-              "(pip install plotly)", file=sys.stderr)
+        if not getattr(write_interactive_html, "_warned", False):
+            write_interactive_html._warned = True
+            print("  NOTE: plotly not installed -- render.html will be skipped."
+                  "  pip install plotly", file=sys.stderr)
         return False
 
     traces = []
@@ -489,17 +522,121 @@ def write_obj(path, verts, faces, name="surface"):
 
 
 # -----------------------------------------------------------------------------
+# per-subject calibration -- measure, do not guess
+# -----------------------------------------------------------------------------
+
+class Calib:
+    """Numbers measured from THIS subject, all in physical units.
+
+    The cohort is not homogeneous: observed voxel sizes differ by 2x and lumen
+    brightness by 230 HU between subjects. Anything expressed in voxels, or any
+    fixed HU threshold, silently means something different per case -- so every
+    value here is derived from the case itself and stated in mm / mm^3 / HU.
+    """
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    def lines(self):
+        return [
+            f"voxel            : {self.sx:.2f} x {self.sy:.2f} x {self.sz:.2f} mm"
+            f"  ({self.vox_mm3:.3f} mm3)",
+            f"lumen            : {self.centre:.0f} HU, spread {self.spread:.0f}"
+            f"   (mean {self.mean:.0f} +/- {self.sd:.0f})",
+            f"rim offset       : {self.rim_mm:.2f} mm"
+            f"   ({self.rim_note})",
+            f"band             : {self.lo:.0f} - {self.hi:.0f} HU",
+            f"bone cut         : > {self.bone_hu:.0f} HU and > 2 mL",
+            f"min branch       : {self.min_branch_mm3:.0f} mm3",
+            f"eligible         : must reach {self.eligible_mm:.0f} mm beyond "
+            f"the wall",
+            f"leak cap         : {self.leak_mL:.1f} mL "
+            f"(aorta is {self.aorta_mL:.1f} mL)",
+            f"despeckle        : components below min branch size are dropped "
+            f"(no morphological opening)",
+        ]
+
+
+def calibrate(ct, mk, spacing, override_lumen=None, override_rim=None,
+              override_band=None, min_branch_mm3=15.0):
+    """Measure the parameters this case needs."""
+    sx, sy, sz = spacing
+    vox_mm3 = sx * sy * sz
+    mkb = mk.astype(bool)
+
+    # ---- lumen: median + MAD, so a stent or calcium cannot move it ----
+    er = max(int(round(2.0 / min(sx, sy))), 1)
+    core = ndi.binary_erosion(mkb, iterations=er)
+    if core.sum() < 50:
+        core = mkb
+    v = ct[core]
+    mean, sd = float(v.mean()), float(v.std())
+    centre = float(np.median(v))
+    spread = max(float(np.median(np.abs(v - centre))) * 1.4826, 8.0)
+    if override_lumen:
+        centre, spread = override_lumen
+
+    # ---- rim: how far does the supplied mask UNDER-segment the lumen? ----
+    # Measured by the FRACTION of each outward shell that is still blood-like,
+    # not by the shell's median. Under-segmentation is usually patchy -- tight in
+    # places, a voxel short in others -- so the median of a shell can sit in fat
+    # while a third of it is still lumen. That third is enough to weld every
+    # branch into one sheath wrapping the whole aorta.
+    dist = ndi.distance_transform_edt(~mkb, sampling=(sz, sy, sx))
+    step = max(min(sx, sy, sz) * 0.6, 0.25)
+    lo_probe = centre - max(3.0 * spread, 120.0)
+    rim_mm, prof = 0.0, []
+    for d in np.arange(step, 6.0 + step, step):
+        sel = (dist > d - step) & (dist <= d)
+        if sel.sum() < 40:
+            continue
+        frac = float(((ct[sel] >= lo_probe) & (ct[sel] <= centre + 3 * spread)
+                      ).mean())
+        prof.append((round(float(d), 2), round(frac, 2)))
+        if frac >= 0.30:
+            rim_mm = float(d)
+        else:
+            break
+    # Always strip at least one in-plane voxel. A branch runs 5-10 mm outward, so
+    # losing its first voxel costs nothing, while NOT stripping lets a single
+    # partially under-segmented ring merge everything into one component.
+    rim_mm = float(np.clip(max(rim_mm, min(sx, sy)), 0.0, 4.0))
+    rim_note = f"blood-like fraction per shell {prof[:5]}"
+    if override_rim is not None:
+        rim_mm, rim_note = float(override_rim), "overridden"
+
+    # ---- band: wide BELOW the lumen, tight above ----
+    # A 1-2 voxel branch is mostly partial volume, so its mean sits well under
+    # the parent's -- measured at 384-503 HU against a 532 HU aorta on one case.
+    # A symmetric band around the lumen throws those away.
+    lo = max(120.0, centre - max(4.0 * spread, 150.0))
+    hi = centre + max(2.5 * spread, 60.0)
+    if override_band:
+        lo, hi = override_band
+    bone_hu = max(centre + 3.0 * spread, 350.0)
+
+    aorta_mL = float(mkb.sum()) * vox_mm3 / 1000.0
+    eligible_mm = 5.0
+    classic = False
+    leak_mL = float(np.clip(0.10 * aorta_mL, 1.0, 4.0))
+
+    return Calib(leak_mL=leak_mL, aorta_mL=aorta_mL, classic=classic,
+                 eligible_mm=eligible_mm, sx=sx, sy=sy, sz=sz, vox_mm3=vox_mm3, centre=centre,
+                 spread=spread, mean=mean, sd=sd, rim_mm=rim_mm,
+                 rim_note=rim_note, lo=lo, hi=hi, bone_hu=bone_hu,
+                 profile=prof, min_branch_mm3=min_branch_mm3)
+
+
+# -----------------------------------------------------------------------------
 # shared plumbing
 # -----------------------------------------------------------------------------
 
 class Ctx:
-    """Everything the methods share: cropped volumes, geometry, intensity model."""
-
-    def __init__(self, img, ct, mk, spacing, margin_mm=45.0, roi_mm=30.0):
-        self.img, self.spacing = img, spacing
+    def __init__(self, img, ct, mk, spacing, cal, margin_mm=45.0, roi_mm=30.0):
+        self.img, self.spacing, self.cal = img, spacing, cal
         sx, sy, sz = spacing
         self.sx, self.sy, self.sz = sx, sy, sz
-        self.vox_mm3 = sx * sy * sz
+        self.vox_mm3 = cal.vox_mm3
         pad = (int(round(margin_mm / sz)), int(round(margin_mm / sy)),
                int(round(margin_mm / sx)))
         self.region = mask_bbox(mk, pad, crop=True)
@@ -508,32 +645,48 @@ class Ctx:
         self.z0 = self.region[0].start or 0
         self.y0 = self.region[1].start or 0
         self.x0 = self.region[2].start or 0
-
-        self.lo, self.hi, self.mu, self.sd = lumen_band(ct, mk, spacing=spacing)
-        self.roi, self.dist_out, self.bone, self.hi_cut = branch_roi(
-            self.ct, self.mk, spacing, roi_mm, self.mu, self.sd)
-        self.roi_mm = roi_mm
-        self.wall = (ndi.binary_dilation(self.mk, iterations=1)
-                     & ~ndi.binary_erosion(self.mk, iterations=1))
         self.sp = np.array([sz, sy, sx])
-        # Direction matrix. Ignoring it puts marching-cubes surfaces in a
-        # MIRRORED position relative to points that went through
-        # TransformIndexToPhysicalPoint -- mesh and markers end up in different
-        # parts of the scene. Column j is the world direction of voxel axis j.
+        self.roi_mm = roi_mm
+        self.lo, self.hi = cal.lo, cal.hi
+        self.mu, self.sd = cal.centre, cal.spread
+
         try:
             self.D = np.array(img.GetDirection(), float).reshape(3, 3)
         except Exception:
             self.D = np.eye(3)
         self.corner = None
 
-        # aorta centreline: centroid per slice, for angles and radial geometry
+        self.dist_out = ndi.distance_transform_edt(~self.mk,
+                                                   sampling=(sz, sy, sx))
+        # bone: bright AND bulky. Intensity alone fails when the lumen is bright.
+        seed = ((self.ct > cal.bone_hu)
+                & ~ndi.binary_dilation(self.mk, iterations=2))
+        seed = ndi.binary_closing(seed, iterations=2)
+        lab_b, n_b = ndi.label(seed)
+        self.bone = np.zeros_like(seed)
+        if n_b:
+            big = np.bincount(lab_b.ravel()) * self.vox_mm3 / 1000.0 > 2.0
+            big[0] = False
+            self.bone = big[lab_b]
+        self.bone = ndi.binary_dilation(ndi.binary_fill_holes(self.bone),
+                                        iterations=max(int(round(
+                                            2.0 / min(sx, sy))), 1))
+
+        self.band = ((self.ct >= cal.lo) & (self.ct <= cal.hi) & ~self.bone)
+        # the search region starts BEYOND the rim
+        self.roi = (self.band & (self.dist_out > cal.rim_mm)
+                    & (self.dist_out <= roi_mm))
+        self.wall = (ndi.binary_dilation(self.mk, iterations=1)
+                     & ~ndi.binary_erosion(self.mk, iterations=1))
+        self.wall_pts = np.argwhere(self.wall).astype(float)
+        self.hi_cut = cal.bone_hu
+
         self.cl = {}
         for z in np.where(self.mk.any(axis=(1, 2)))[0]:
             cy, cx = ndi.center_of_mass(self.mk[z])
             self.cl[int(z)] = (cy, cx)
 
     def verts_to_world(self, v):
-        """Marching-cubes vertices (mm from the crop corner, x/y/z) -> world mm."""
         if v is None:
             return None
         if self.corner is None:
@@ -541,75 +694,88 @@ class Ctx:
         return self.corner + np.asarray(v, float) @ self.D.T
 
     def to_mm(self, vox):
-        """voxel (z, y, x) in the CROP -> physical (x, y, z) mm."""
         v = np.asarray(vox, float)
         return np.array(self.img.TransformIndexToPhysicalPoint(
             (int(round(v[2])) + self.x0, int(round(v[1])) + self.y0,
              int(round(v[0])) + self.z0)), float)
+
+    def strip_rim(self, mask):
+        """Remove the shell of under-segmented lumen hugging the aorta."""
+        return mask & (self.dist_out > self.cal.rim_mm)
+
+    def despeckle(self, mask, min_mm3=None):
+        """Drop small components INSTEAD of morphological opening.
+
+        Opening erodes then dilates, which annihilates anything thinner than the
+        structuring element. Reference branches measured 14-34 voxels, about two
+        voxels across, so opening was deleting the very things being looked for.
+        """
+        mm3 = self.cal.min_branch_mm3 if min_mm3 is None else min_mm3
+        lab, n = ndi.label(mask)
+        if n == 0:
+            return mask
+        keep = np.bincount(lab.ravel()) * self.vox_mm3 >= mm3
+        keep[0] = False
+        return keep[lab]
+
+    def snap_to_wall(self, pt_vox):
+        """Nearest point on the aortic wall -- the ostium lives on the wall."""
+        if not len(self.wall_pts):
+            return np.asarray(pt_vox, float)
+        d = np.linalg.norm((self.wall_pts - np.asarray(pt_vox, float)) * self.sp,
+                           axis=1)
+        return self.wall_pts[int(np.argmin(d))]
 
 
 class Result:
     def __init__(self, name, mask, ostia_vox, dirs=None, radii=None,
                  runtime=0.0, note=""):
         self.name = name
-        self.mask = mask                       # bool volume of believed branches
-        self.ostia_vox = list(ostia_vox)       # [(z, y, x)] in crop coords
+        self.mask = mask
+        self.ostia_vox = list(ostia_vox)
         self.dirs = dirs or [None] * len(self.ostia_vox)
         self.radii = radii or [None] * len(self.ostia_vox)
         self.runtime = runtime
         self.note = note
 
 
-def components(mask, ctx, min_mm3=8.0):
-    lab, _ = ndi.label(mask)
-    sizes = np.bincount(lab.ravel())
+def ostia_from_mask(mask, ctx, max_n=25):
+    """Components -> one ostium each, with direction and radius."""
+    lab, n = ndi.label(mask)
+    if n == 0:
+        return [], [], []
+    sizes = np.bincount(lab.ravel()) * ctx.vox_mm3
     sizes[0] = 0
-    min_vox = max(int(min_mm3 / ctx.vox_mm3), 1)
-    return lab, [int(i) for i in np.argsort(sizes)[::-1] if sizes[i] >= min_vox]
-
-
-def ostia_from_mask(mask, ctx, min_mm3=8.0, max_n=25, use_contact=True):
-    """Shared post-step: components -> one ostium each.
-
-    If the component already touches the aorta, take the contact zone and pick
-    the voxel that maximises distance to the edge of the ramification -- the
-    centre of the opening, following Tahoces. Otherwise fall back to extending
-    the component's local axis back to the wall.
-    """
-    lab, keep = components(mask, ctx, min_mm3)
-    edt = ndi.distance_transform_edt(mask, sampling=tuple(ctx.sp)) if mask.any() \
-        else np.zeros_like(mask, float)
-    near_wall = ndi.binary_dilation(ctx.mk, iterations=2)
+    keep = [int(i) for i in np.argsort(sizes)[::-1]
+            if sizes[i] >= ctx.cal.min_branch_mm3][:max_n]
+    edt = ndi.distance_transform_edt(mask, sampling=tuple(ctx.sp))
+    near = ndi.binary_dilation(ctx.mk, iterations=max(
+        int(round((ctx.cal.rim_mm + 2.0) / min(ctx.sx, ctx.sy))), 2))
 
     ostia, dirs, radii = [], [], []
-    for i in keep[:max_n]:
+    for i in keep:
         comp = lab == i
         pts = np.argwhere(comp).astype(float)
-        contact = comp & near_wall
-        if use_contact and contact.any():
-            cpts = np.argwhere(contact)
-            best = cpts[int(np.argmax(edt[tuple(cpts.T)]))]
-            ost = best.astype(float)
+        contact = comp & near
+        if contact.any():
+            cp = np.argwhere(contact)
+            deepest = cp[int(np.argmax(edt[tuple(cp.T)]))]
+            ost = ctx.snap_to_wall(deepest)      # the opening is ON the wall
         else:
             pmm = pts * ctx.sp
             cen = pmm - pmm.mean(axis=0)
-            step = max(len(cen) // 4000, 1)
-            _, _, vv = np.linalg.svd(cen[::step], full_matrices=False)
-            try:
-                hit, _g, ost, _u = link_to_aorta(pts, ctx.dist_out, vv[0],
-                                                 ctx.spacing, sub_mk=ctx.mk)
-            except TypeError:      # older copy of the helper, no wall snapping
-                hit, _g, ost, _u = link_to_aorta(pts, ctx.dist_out, vv[0],
-                                                 ctx.spacing)
+            st = max(len(cen) // 4000, 1)
+            _, _, vv = np.linalg.svd(cen[::st], full_matrices=False)
+            hit, _g, ost, _u = link_to_aorta(pts, ctx.dist_out, vv[0],
+                                             ctx.spacing, sub_mk=ctx.mk)
             if not hit or ost is None:
                 continue
             ost = np.asarray(ost, float)
 
-        # outward direction + radius from the proximal 12 mm
         omm = ost * ctx.sp
         d = np.linalg.norm(pts * ctx.sp - omm, axis=1)
         sel = d <= 12.0
-        if sel.sum() >= 5:
+        if sel.sum() >= 4:
             pm = pts[sel] * ctx.sp
             c = pm - pm.mean(axis=0)
             _, _, vv = np.linalg.svd(c, full_matrices=False)
@@ -628,13 +794,13 @@ def ostia_from_mask(mask, ctx, min_mm3=8.0, max_n=25, use_contact=True):
 
 
 def drop_end_caps(res, ctx, margin_mm=6.0):
-    """The flat cropped top and bottom of the mask are not branch origins."""
     zs = np.where(ctx.mk.any(axis=(1, 2)))[0]
     if not len(zs):
         return res
     zlo, zhi = zs[0] * ctx.sz, zs[-1] * ctx.sz
     keep = [k for k, o in enumerate(res.ostia_vox)
-            if (o[0] * ctx.sz - zlo) >= margin_mm and (zhi - o[0] * ctx.sz) >= margin_mm]
+            if (o[0] * ctx.sz - zlo) >= margin_mm
+            and (zhi - o[0] * ctx.sz) >= margin_mm]
     res.ostia_vox = [res.ostia_vox[k] for k in keep]
     res.dirs = [res.dirs[k] for k in keep]
     res.radii = [res.radii[k] for k in keep]
@@ -655,41 +821,230 @@ def dedupe(res, ctx, merge_mm=6.0):
     return res
 
 
+def ball(r_mm, spacing):
+    sx, sy, sz = spacing
+    rz, ry, rx = (max(int(np.ceil(r_mm / q)), 1) for q in (sz, sy, sx))
+    zz, yy, xx = np.ogrid[-rz:rz + 1, -ry:ry + 1, -rx:rx + 1]
+    return ((zz * sz) ** 2 + (yy * sy) ** 2 + (xx * sx) ** 2) <= r_mm ** 2
+
+
+def remove_sheath(grown, ctx, core_mm=4.0, reach_mm=None):
+    """Delete the wall-hugging sheath while KEEPING every branch junction.
+
+    The sheath and a branch base are the same thickness, so no erosion or opening
+    can separate them -- both are thin. What actually differs is that a branch
+    has substance continuing outward and a sheath patch does not.
+
+    So: take the shafts (everything far enough from the wall that the sheath
+    cannot reach), then grow them back inward THROUGH the grown mask only. A
+    branch base is a few mm of geodesic distance from its own shaft, so it is
+    recovered together with the junction. Sheath that leads nowhere is never
+    reached and disappears. Nothing is cut; the branches are simply never
+    disconnected from the wall in the first place.
+    """
+    reach_mm = (core_mm + 4.0) if reach_mm is None else reach_mm
+    core = grown & (ctx.dist_out >= core_mm)
+    if not core.any():
+        return np.zeros_like(grown)
+    st = ball(min(ctx.sp) * 1.01, ctx.spacing)
+    keep = core
+    for _ in range(max(int(np.ceil(reach_mm / min(ctx.sp))), 1)):
+        grown_once = ndi.binary_dilation(keep, structure=st) & grown
+        if (grown_once == keep).all():
+            break
+        keep = grown_once
+    return keep
+
+
+def ostia_centerline(lab, ctx, max_out_mm=12.0, eligible_mm=None):
+    """Ostium, direction, seed and radius from a shell-centroid centreline.
+
+    Now that each branch stays attached to the aorta, the junction can be used
+    instead of worked around. Step outward in thin shells; in each shell take the
+    lumen-weighted centroid of the branch. Those centroids form a centreline that
+    begins AT the wall, so the ostium is simply where it starts -- the centre of
+    the opening, by construction, rather than a point inferred by extending a
+    line backwards.
+    """
+    eligible_mm = ctx.cal.eligible_mm if eligible_mm is None else eligible_mm
+    step = float(min(ctx.sp))
+    ostia, dirs, radii = [], [], []
+    for i in [int(v) for v in np.unique(lab) if v > 0]:
+        comp = lab == i
+        if comp.sum() * ctx.vox_mm3 < ctx.cal.min_branch_mm3:
+            continue
+        reach = float(ctx.dist_out[comp].max())
+        if reach < eligible_mm:
+            continue                       # never leaves the wall -> not eligible
+        edt = ndi.distance_transform_edt(comp, sampling=tuple(ctx.sp))
+
+        line = []                          # (distance from wall, centroid voxel)
+        for d in np.arange(0.0, min(max_out_mm, reach) + step, step):
+            sel = comp & (ctx.dist_out >= d) & (ctx.dist_out < d + step)
+            pts = np.argwhere(sel)
+            if len(pts) == 0:
+                continue
+            w = edt[tuple(pts.T)] + 1e-6   # bias toward the lumen centre
+            line.append((float(d), (pts * w[:, None]).sum(0) / w.sum()))
+        if len(line) < 3:
+            continue
+
+        ost = ctx.snap_to_wall(line[0][1])
+        prox = np.array([c for d, c in line if 1.0 <= d <= 10.0], float)
+        if len(prox) >= 2:
+            pm = prox * ctx.sp
+            u = pm[-1] - pm[0]
+            n = np.linalg.norm(u)
+            u = u / n if n > 1e-6 else None
+        else:
+            u = None
+        seed = min(line, key=lambda t: abs(t[0] - 5.0))[1]
+        r = float(ndi.map_coordinates(edt, np.asarray(seed, float)[:, None],
+                                      order=1)[0])
+        ostia.append(ost)
+        dirs.append(u)
+        radii.append(r)
+    return ostia, dirs, radii
+
+
+def split_outward(grown, ctx, seed_margin_mm=1.0):
+    """One label per OUTWARD structure, each KEEPING its junction with the wall.
+
+    The mask under-segments slightly, so a shell of lumen-intensity blood hugs
+    the aorta and welds every branch into one component. Cutting that shell out
+    fixes the merging but amputates every branch at its base -- the junction is
+    exactly where the ostium is, so that trade is a bad one.
+
+    Instead: take seeds from the part of each structure that reaches BEYOND the
+    shell, then flood them back through the whole grown region. Branches come out
+    separated from each other and still attached to the wall. Sheath that leads
+    nowhere gets no seed and is dropped.
+    """
+    from skimage.segmentation import watershed
+
+    seed_zone = grown & (ctx.dist_out > ctx.cal.rim_mm + seed_margin_mm)
+    markers, n = ndi.label(seed_zone)
+    if n == 0:
+        return np.zeros(grown.shape, np.int32), 0
+    sizes = np.bincount(markers.ravel()) * ctx.vox_mm3
+    keep = sizes >= ctx.cal.min_branch_mm3
+    keep[0] = False
+    if not keep.any():
+        return np.zeros(grown.shape, np.int32), 0
+    remap = np.zeros(len(sizes), np.int32)
+    remap[np.flatnonzero(keep)] = np.arange(1, int(keep.sum()) + 1)
+    markers = remap[markers]
+    # flat elevation -> geodesic nearest-seed assignment inside `grown`
+    lab = watershed(np.zeros(grown.shape, np.uint8), markers, mask=grown)
+    return lab.astype(np.int32), int(markers.max())
+
+
+def ostia_from_labels(lab, ctx, max_n=25, eligible_mm=None):
+    """One ostium per label, taken at its contact with the aortic wall.
+
+    Structures that never get far from the wall are rejected. That is the task's
+    own eligibility rule -- a daughter must be followable at least 5 mm beyond
+    the aortic wall -- and it is exactly what separates a real branch from the
+    shell of under-segmented lumen that coats the aorta and can otherwise pick up
+    a seed of its own.
+    """
+    eligible_mm = ctx.cal.eligible_mm if eligible_mm is None else eligible_mm
+    ids = [int(i) for i in np.unique(lab) if i > 0]
+    sizes = {i: float((lab == i).sum()) * ctx.vox_mm3 for i in ids}
+    ids = sorted(ids, key=lambda i: -sizes[i])[:max_n]
+    near = ndi.binary_dilation(ctx.mk, iterations=2)
+
+    ostia, dirs, radii = [], [], []
+    for i in ids:
+        comp = lab == i
+        if sizes[i] < ctx.cal.min_branch_mm3:
+            continue
+        if float(ctx.dist_out[comp].max()) < eligible_mm:
+            continue                     # hugs the wall -> not an eligible daughter
+        edt = ndi.distance_transform_edt(comp, sampling=tuple(ctx.sp))
+        pts = np.argwhere(comp).astype(float)
+        contact = comp & near
+        if contact.any():
+            cp = np.argwhere(contact)
+            ost = ctx.snap_to_wall(cp[int(np.argmax(edt[tuple(cp.T)]))])
+        else:
+            pmm = pts * ctx.sp
+            cen = pmm - pmm.mean(axis=0)
+            st = max(len(cen) // 4000, 1)
+            _, _, vv = np.linalg.svd(cen[::st], full_matrices=False)
+            hit, _g, ost, _u = link_to_aorta(pts, ctx.dist_out, vv[0],
+                                             ctx.spacing, sub_mk=ctx.mk)
+            if not hit or ost is None:
+                continue
+            ost = np.asarray(ost, float)
+
+        omm = ost * ctx.sp
+        d = np.linalg.norm(pts * ctx.sp - omm, axis=1)
+        # direction and radius from the proximal segment, ignoring the junction
+        sel = (d >= 2.0) & (d <= 12.0)
+        if sel.sum() >= 4:
+            pm = pts[sel] * ctx.sp
+            c = pm - pm.mean(axis=0)
+            _, _, vv = np.linalg.svd(c, full_matrices=False)
+            u = vv[0]
+            if np.dot(pm.mean(axis=0) - omm, u) < 0:
+                u = -u
+            band = pts[sel][(d[sel] >= 3.5) & (d[sel] <= 6.5)]
+            r = (float(ndi.map_coordinates(edt, band.mean(axis=0)[:, None],
+                                           order=1)[0]) if len(band) else None)
+        else:
+            u, r = None, None
+        ostia.append(ost)
+        dirs.append(u)
+        radii.append(r)
+    return ostia, dirs, radii
+
+
+def grow_from_aorta(ctx, limit_mm, blocked=None):
+    """Everything band-like and connected to the aorta, out to limit_mm.
+
+    Growth runs THROUGH the rim so connectivity is preserved; the rim is only
+    stripped afterwards, when components are formed.
+    """
+    allowed = ctx.band & (ctx.dist_out <= limit_mm)
+    if blocked is not None:
+        allowed = allowed & ~blocked
+    lab, _ = ndi.label(allowed | ctx.mk)
+    touch = set(int(v) for v in np.unique(lab[ctx.mk]) if v > 0)
+    return np.isin(lab, list(touch)) & ~ctx.mk
+
+
 # -----------------------------------------------------------------------------
-# M1  Frangi vesselness
+# the methods
 # -----------------------------------------------------------------------------
 
-def m1_frangi(ctx, sigmas=(0.7, 1.0, 1.5, 2.0, 3.0), frac=0.30):
+def m1_frangi(ctx, sigmas=None, frac=0.30):
     t0 = time.time()
+    if sigmas is None:                       # scales in mm, not voxels
+        sigmas = (0.7, 1.0, 1.5, 2.0, 3.0)
     vess, _ = frangi_3d(ctx.ct, ctx.spacing, sigmas, roi=ctx.roi)
     thr = frac * float(np.percentile(vess[ctx.roi], 99.5)) if ctx.roi.any() else 0
-    cand = ndi.binary_opening((vess >= thr) & ctx.roi, iterations=1)
-    o, d, r = ostia_from_mask(cand, ctx, use_contact=False)
-    return Result("M1 frangi", cand, o, d, r, time.time() - t0,
-                  f"thr={thr:.3f}")
+    cand = ctx.despeckle((vess >= thr) & ctx.roi)
+    o, d, r = ostia_from_mask(cand, ctx)
+    return Result("M1 frangi", cand, o, d, r, time.time() - t0, f"thr={thr:.3f}")
 
-
-# -----------------------------------------------------------------------------
-# M2  naive intensity band + connectivity  (the control)
-# -----------------------------------------------------------------------------
 
 def m2_band_connect(ctx):
     t0 = time.time()
-    band = (ctx.ct >= ctx.lo) & (ctx.ct <= ctx.hi) & ~ctx.bone
-    band = ndi.binary_opening(band, iterations=1)
-    lab, _ = ndi.label(band | ctx.mk)
-    touch = set(int(v) for v in np.unique(lab[ctx.mk]) if v > 0)
-    grown = np.isin(lab, list(touch)) & ~ctx.mk & (ctx.dist_out <= ctx.roi_mm)
-    o, d, r = ostia_from_mask(grown, ctx)
-    return Result("M2 band_connect", grown, o, d, r, time.time() - t0,
-                  f"band {ctx.lo:.0f}-{ctx.hi:.0f} HU")
+    lab, n = split_outward(grow_from_aorta(ctx, ctx.roi_mm), ctx)
+    o, d, r = ostia_from_labels(lab, ctx)
+    return Result("M2 band_connect", lab > 0, o, d, r, time.time() - t0,
+                  f"band {ctx.lo:.0f}-{ctx.hi:.0f} HU, {n} structures")
 
 
-# -----------------------------------------------------------------------------
-# M3  Tahoces-style two-phase expansion with leak detection
-# -----------------------------------------------------------------------------
+def m3_classic(ctx, phase1_mm=20.0, phase2_mm=30.0, leak_mL=8.0):
+    """The ORIGINAL M3, unchanged: grow, block oversized components, regrow.
 
-def m3_expansion(ctx, phase1_mm=20.0, phase2_mm=30.0, leak_mL=8.0):
+    Components are kept whole, so each branch keeps the voxels where it meets the
+    aorta and the junctions look like real junctions. The cost is a shell of
+    under-segmented lumen coating the aorta, which is cosmetic; trying to remove
+    it is what broke the junctions.
+    """
     t0 = time.time()
     band = (ctx.ct >= ctx.lo) & (ctx.ct <= ctx.hi) & ~ctx.bone
 
@@ -699,37 +1054,81 @@ def m3_expansion(ctx, phase1_mm=20.0, phase2_mm=30.0, leak_mL=8.0):
         touch = set(int(v) for v in np.unique(lab[ctx.mk]) if v > 0)
         return np.isin(lab, list(touch)) & ~ctx.mk
 
-    # phase 1: grow to 20 mm, flag components that blow up (organ leakage)
     g1 = grow(phase1_mm, np.zeros_like(band))
     lab1, n1 = ndi.label(g1)
     blocked = np.zeros_like(band)
     n_leak = 0
     if n1:
-        sizes = np.bincount(lab1.ravel()) * ctx.vox_mm3 / 1000.0
-        leaks = [i for i in range(1, n1 + 1) if sizes[i] > leak_mL]
+        mL = np.bincount(lab1.ravel()) * ctx.vox_mm3 / 1000.0
+        leaks = [i for i in range(1, n1 + 1) if mL[i] > leak_mL]
         n_leak = len(leaks)
         if leaks:
             blocked = np.isin(lab1, leaks)
 
-    # phase 2: grow further, avoiding the flagged regions
-    g2 = grow(phase2_mm, blocked)
-    o, d, r = ostia_from_mask(g2, ctx)
+    g2 = ndi.binary_opening(grow(phase2_mm, blocked), iterations=1)
+    lab2, _ = ndi.label(g2)
+    o, d, r = ostia_from_labels(lab2, ctx, eligible_mm=0.0)
     return Result("M3 expansion", g2, o, d, r, time.time() - t0,
-                  f"{n_leak} leak(s) blocked")
+                  f"classic | {n_leak} leak(s) blocked, cap {leak_mL} mL")
 
 
-# -----------------------------------------------------------------------------
-# M4  wall flux -- unrolled shell, peaks are openings
-# -----------------------------------------------------------------------------
+def m3_expansion(ctx, phase_mm=30.0, leak_mL=None, core_mm=4.0):
+    """Original growth, kept whole; sheath removed after; leaks judged last.
 
-def m4_wall_flux(ctx, shell=(1.5, 6.0), n_ang=120, min_sep_mm=6.0):
+    Order matters. Before the sheath is removed, every branch and the wall
+    coating are ONE component, so any per-component size rule sees a single
+    oversized blob and blocks the lot -- which is how the celiac and renals were
+    being deleted. Leak handling therefore runs last, once components are real
+    branches, and a leak is truncated rather than dropped.
+    """
+    if ctx.cal.classic:
+        return m3_classic(ctx)
     t0 = time.time()
+    leak_mL = ctx.cal.leak_mL if leak_mL is None else leak_mL
+    band = (ctx.ct >= ctx.lo) & (ctx.ct <= ctx.hi) & ~ctx.bone
+
+    allowed = band & (ctx.dist_out <= phase_mm)
+    lb, _ = ndi.label(allowed | ctx.mk)
+    touch = set(int(v) for v in np.unique(lb[ctx.mk]) if v > 0)
+    grown = np.isin(lb, list(touch)) & ~ctx.mk
+
+    cleaned = remove_sheath(grown, ctx, core_mm=core_mm)
+    lab, n = ndi.label(cleaned)
+
+    out = np.zeros(lab.shape, np.int32)
+    n_trunc = n_drop = 0
+    for i in range(1, n + 1):
+        comp = lab == i
+        if not comp.any():
+            continue
+        if comp.sum() * ctx.vox_mm3 / 1000.0 <= leak_mL:
+            out[comp] = i
+            continue
+        for lim in (10.0, 6.0, 3.5):        # a leak means the growth ran too far
+            t = comp & (ctx.dist_out <= lim)
+            if t.any() and t.sum() * ctx.vox_mm3 / 1000.0 <= leak_mL:
+                out[t] = i
+                n_trunc += 1
+                break
+        else:
+            n_drop += 1
+
+    o, d, r = ostia_centerline(out, ctx)
+    removed = (grown.sum() - cleaned.sum()) * ctx.vox_mm3 / 1000.0
+    return Result("M3 expansion", out > 0, o, d, r, time.time() - t0,
+                  f"{n} structures, {removed:.2f} mL sheath removed, "
+                  f"{n_trunc} truncated, {n_drop} dropped")
+
+
+def m4_wall_flux(ctx, n_ang=120, min_sep_mm=6.0):
+    t0 = time.time()
+    shell = (ctx.cal.rim_mm + 0.5, ctx.cal.rim_mm + 6.0)
     zs = sorted(ctx.cl)
     prof = np.full((len(zs), n_ang), np.nan, np.float32)
     for row, z in enumerate(zs):
-        shellz = (ctx.dist_out[z] >= shell[0]) & (ctx.dist_out[z] <= shell[1]) \
-            & ~ctx.bone[z]
-        ys, xs = np.where(shellz)
+        sh = ((ctx.dist_out[z] >= shell[0]) & (ctx.dist_out[z] <= shell[1])
+              & ~ctx.bone[z])
+        ys, xs = np.where(sh)
         if not len(ys):
             continue
         cy, cx = ctx.cl[z]
@@ -741,9 +1140,9 @@ def m4_wall_flux(ctx, shell=(1.5, 6.0), n_ang=120, min_sep_mm=6.0):
         with np.errstate(invalid="ignore"):
             prof[row] = np.where(cnts > 0, sums / np.maximum(cnts, 1), np.nan)
 
-    sm = ndi.gaussian_filter(np.nan_to_num(prof, nan=ctx.mu - 4 * ctx.sd),
+    sm = ndi.gaussian_filter(np.nan_to_num(prof, nan=ctx.lo - 100),
                              (1.2, 1.2), mode="wrap")
-    thr = ctx.mu - 1.5 * ctx.sd
+    thr = ctx.lo
     peaks = (sm == ndi.maximum_filter(sm, size=(7, 9), mode="wrap")) & (sm > thr)
 
     ostia, mask = [], np.zeros_like(ctx.mk)
@@ -751,7 +1150,6 @@ def m4_wall_flux(ctx, shell=(1.5, 6.0), n_ang=120, min_sep_mm=6.0):
         z = zs[row]
         ang = (col + 0.5) / n_ang * 2 * np.pi - np.pi
         cy, cx = ctx.cl[z]
-        # walk out from the centre until we leave the mask -> wall point
         for rad in np.arange(0.5, 40.0, 0.5):
             yy = cy + rad * np.sin(ang) / ctx.sy
             xx = cx + rad * np.cos(ang) / ctx.sx
@@ -766,108 +1164,75 @@ def m4_wall_flux(ctx, shell=(1.5, 6.0), n_ang=120, min_sep_mm=6.0):
     return dedupe(res, ctx, min_sep_mm)
 
 
-# -----------------------------------------------------------------------------
-# M5  fast-marching escape with a soft intensity speed function
-# -----------------------------------------------------------------------------
-
-def m5_escape(ctx, max_cost=18.0):
+def m5_escape(ctx, max_cost=8.0):
     t0 = time.time()
     try:
         from skimage.graph import MCP_Geometric
     except ImportError:
         return Result("M5 escape", np.zeros_like(ctx.mk), [], None, None, 0.0,
                       "skimage.graph unavailable")
-    # soft speed: 1 inside the lumen band, rising cost as intensity falls away.
-    # Unlike a hard band this survives partial-volume dropout at an ostium.
-    z = np.clip((ctx.ct - (ctx.mu - 3 * ctx.sd)) / (3 * ctx.sd), 0, 1)
+    z = np.clip((ctx.ct - ctx.lo) / max(ctx.hi - ctx.lo, 1.0), 0, 1)
     cost = (1.0 / (0.08 + z)).astype(np.float64)
-    # np.inf is impassable; a large finite cost still gets explored, which makes
-    # the front crawl over the whole crop and takes minutes instead of seconds.
-    blocked = ctx.bone | (ctx.dist_out > ctx.roi_mm)
-    cost[blocked] = np.inf
-    cost[ctx.mk] = 0.05                       # free travel inside the lumen
+    cost[ctx.bone | (ctx.dist_out > ctx.roi_mm)] = np.inf
+    cost[ctx.mk] = 0.05
 
     mcp = MCP_Geometric(cost, sampling=tuple(ctx.sp))
     starts = np.argwhere(ctx.wall & ctx.mk)
     if not len(starts):
         return Result("M5 escape", np.zeros_like(ctx.mk), [], None, None,
                       time.time() - t0, "no wall")
-    step = max(len(starts) // 1500, 1)
+    st = max(len(starts) // 1500, 1)
     try:
-        gd, _ = mcp.find_costs(starts[::step].tolist(),
+        gd, _ = mcp.find_costs(starts[::st].tolist(),
                                max_cumulative_cost=max_cost)
-    except TypeError:                          # newer skimage dropped the arg
-        gd, _ = mcp.find_costs(starts[::step].tolist())
+    except TypeError:
+        gd, _ = mcp.find_costs(starts[::st].tolist())
     gd = np.nan_to_num(gd, nan=1e6, posinf=1e6)
+    lab, n = split_outward((gd < max_cost) & ~ctx.mk, ctx)
+    o, d, r = ostia_from_labels(lab, ctx)
+    return Result("M5 escape", lab > 0, o, d, r, time.time() - t0,
+                  f"cost<{max_cost}, {n} structures")
 
-    reach = (gd < max_cost) & ~ctx.mk & (ctx.dist_out > 0)
-    reach = ndi.binary_opening(reach, iterations=1)
-    o, d, r = ostia_from_mask(reach, ctx)
-    return Result("M5 escape", reach, o, d, r, time.time() - t0,
-                  f"cost<{max_cost}")
-
-
-# -----------------------------------------------------------------------------
-# M6  Optimally Oriented Flux (sphere-sampled)
-# -----------------------------------------------------------------------------
 
 def _sphere_dirs(n=42):
     i = np.arange(n, dtype=float) + 0.5
     phi = np.arccos(1 - 2 * i / n)
-    gold = np.pi * (1 + 5 ** 0.5)
-    th = gold * i
+    th = np.pi * (1 + 5 ** 0.5) * i
     return np.stack([np.cos(th) * np.sin(phi), np.sin(th) * np.sin(phi),
-                     np.cos(phi)], axis=1)          # (n, 3) as (z, y, x)
+                     np.cos(phi)], axis=1)
 
 
 def m6_oof(ctx, radii_mm=(1.0, 1.5, 2.5), n_dir=42, frac=0.30):
-    """Flux of the image gradient through a sphere of radius r.
-
-    Unlike a Hessian, OOF integrates over a sphere SURFACE, so a bright object
-    sitting next to the vessel contributes far less -- the property that makes it
-    the sensible choice when the aorta is pressed against the vertebral body.
-    """
     t0 = time.time()
     idx = np.argwhere(ctx.roi)
     if not len(idx):
-        return Result("M6 oof", np.zeros_like(ctx.mk), [], None, None, 0.0, "no roi")
+        return Result("M6 oof", np.zeros_like(ctx.mk), [], None, None, 0.0,
+                      "empty search region")
     gz, gy, gx = np.gradient(ctx.ct.astype(np.float32), ctx.sz, ctx.sy, ctx.sx)
     dirs = _sphere_dirs(n_dir)
     best = np.zeros(len(idx), np.float32)
-
     for r_mm in radii_mm:
         Q = np.zeros((len(idx), 3, 3), np.float32)
         for u in dirs:
-            off = idx + (u * r_mm / ctx.sp)
-            co = np.clip(off, 0, np.array(ctx.ct.shape) - 1).T
+            co = np.clip(idx + (u * r_mm / ctx.sp), 0,
+                         np.array(ctx.ct.shape) - 1).T
             g = np.stack([ndi.map_coordinates(a, co, order=1)
                           for a in (gz, gy, gx)], axis=1)
-            flux = (g * u).sum(axis=1)               # inward-positive for bright
-            Q += flux[:, None, None] * np.outer(u, u)[None, :, :]
+            Q += (g * u).sum(axis=1)[:, None, None] * np.outer(u, u)[None]
         Q /= n_dir
         ev = np.linalg.eigvalsh(Q)
-        order = np.argsort(np.abs(ev), axis=1)
-        ev = np.take_along_axis(ev, order, axis=1)
-        # bright tube: the two largest-magnitude eigenvalues strongly negative
-        resp = np.clip(-(ev[:, 1] + ev[:, 2]) / 2.0, 0, None) * (r_mm ** 0.5)
-        best = np.maximum(best, resp)
-
+        ev = np.take_along_axis(ev, np.argsort(np.abs(ev), axis=1), axis=1)
+        best = np.maximum(best, np.clip(-(ev[:, 1] + ev[:, 2]) / 2.0, 0, None)
+                          * (r_mm ** 0.5))
     out = np.zeros(ctx.ct.shape, np.float32)
     out[ctx.roi] = best
     thr = frac * float(np.percentile(best, 99.5)) if best.size else 0.0
-    cand = ndi.binary_opening((out >= thr) & ctx.roi, iterations=1)
-    o, d, r = ostia_from_mask(cand, ctx, use_contact=False)
+    cand = ctx.despeckle((out >= thr) & ctx.roi)
+    o, d, r = ostia_from_mask(cand, ctx)
     return Result("M6 oof", cand, o, d, r, time.time() - t0, f"thr={thr:.3f}")
 
 
-# -----------------------------------------------------------------------------
-# M7  mask geometry only -- outward bulges on a fitted tube
-# -----------------------------------------------------------------------------
-
 def m7_bulge(ctx, n_ang=90, k_sd=2.0, min_sep_mm=6.0):
-    """Never looks at the CT. If the supplied mask bulges at the origins, this
-    finds them for free -- and it is completely independent of every intensity
-    based method, which makes it valuable for the consensus vote."""
     t0 = time.time()
     zs = sorted(ctx.cl)
     rad = np.full((len(zs), n_ang), np.nan, np.float32)
@@ -884,33 +1249,27 @@ def m7_bulge(ctx, n_ang=90, k_sd=2.0, min_sep_mm=6.0):
             m = b == k
             if m.any():
                 rad[row, k] = rr[m].max()
-
-    filled = np.nan_to_num(rad, nan=np.nanmedian(rad) if np.isfinite(rad).any() else 0)
-    smooth = ndi.gaussian_filter(filled, (3.0, 4.0), mode="wrap")
-    dev = filled - smooth
-    s = float(np.nanstd(dev)) or 1.0
+    filled = np.nan_to_num(rad, nan=np.nanmedian(rad)
+                           if np.isfinite(rad).any() else 0)
+    dev = filled - ndi.gaussian_filter(filled, (3.0, 4.0), mode="wrap")
+    sdv = float(np.nanstd(dev)) or 1.0
     peaks = ((dev == ndi.maximum_filter(dev, size=(5, 7), mode="wrap"))
-             & (dev > k_sd * s))
-
+             & (dev > k_sd * sdv))
     ostia, mask = [], np.zeros_like(ctx.mk)
     for row, col in np.argwhere(peaks):
         z = zs[row]
         ang = (col + 0.5) / n_ang * 2 * np.pi - np.pi
         cy, cx = ctx.cl[z]
         rr = filled[row, col]
-        yy = cy + rr * np.sin(ang) / ctx.sy
-        xx = cx + rr * np.cos(ang) / ctx.sx
+        yy, xx = cy + rr * np.sin(ang) / ctx.sy, cx + rr * np.cos(ang) / ctx.sx
         if 0 <= yy < ctx.mk.shape[1] and 0 <= xx < ctx.mk.shape[2]:
             ostia.append(np.array([z, yy, xx], float))
             mask[z, int(yy), int(xx)] = True
     res = Result("M7 bulge", ndi.binary_dilation(mask, iterations=2), ostia,
-                 None, None, time.time() - t0, f"dev > {k_sd} sd ({k_sd * s:.2f} mm)")
+                 None, None, time.time() - t0,
+                 f"dev > {k_sd} sd ({k_sd * sdv:.2f} mm)")
     return dedupe(res, ctx, min_sep_mm)
 
-
-# -----------------------------------------------------------------------------
-# M8  consensus
-# -----------------------------------------------------------------------------
 
 def m8_consensus(results, ctx, tol_mm=6.0, min_votes=3):
     t0 = time.time()
@@ -938,8 +1297,9 @@ def m8_consensus(results, ctx, tol_mm=6.0, min_votes=3):
             votes.append(sorted(names))
     mask = np.zeros_like(ctx.mk)
     for o in ostia:
-        zz, yy, xx = [int(round(v)) for v in o]
-        if 0 <= zz < mask.shape[0] and 0 <= yy < mask.shape[1] and 0 <= xx < mask.shape[2]:
+        zz, yy, xx = [int(round(q)) for q in o]
+        if (0 <= zz < mask.shape[0] and 0 <= yy < mask.shape[1]
+                and 0 <= xx < mask.shape[2]):
             mask[zz, yy, xx] = True
     return Result("M8 consensus", ndi.binary_dilation(mask, iterations=2),
                   ostia, None, None, time.time() - t0,
@@ -947,153 +1307,183 @@ def m8_consensus(results, ctx, tol_mm=6.0, min_votes=3):
 
 
 # -----------------------------------------------------------------------------
-# figures
+# ground-truth scoring
 # -----------------------------------------------------------------------------
 
-def fig_3d(results, ctx, path, case_id, cap=18_000):
-    # matplotlib's 3D renderer is soft-sorted and gets very slow past ~25k
-    # polygons per axes. Eight panels at 100k each simply never finishes, so the
-    # static figure uses a coarse mesh; the plotly HTML gets the detailed one.
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-    av, af = fine_surface(ctx.mk, ctx.spacing, cap=cap)
-    n = len(results)
-    cols, rows = 4, int(np.ceil(n / 4))
-    fig = plt.figure(figsize=(4.2 * cols, 5.0 * rows), facecolor="white")
-    for k, res in enumerate(results):
-        ax = fig.add_subplot(rows, cols, k + 1, projection="3d")
-        allv = []
-        if av is not None:
-            c = Poly3DCollection(av[af], alpha=0.22)
-            c.set_facecolor("#d94a4a")
-            c.set_edgecolor("none")
-            ax.add_collection3d(c)
-            allv.append(av)
-        bv, bf = fine_surface(res.mask & ~ctx.mk, ctx.spacing, cap=cap)
-        if bv is not None:
-            c = Poly3DCollection(bv[bf], alpha=0.95)
-            c.set_facecolor("#f2c14e")
-            c.set_edgecolor("none")
-            ax.add_collection3d(c)
-            allv.append(bv)
-        if res.ostia_vox:
-            P = np.array([np.asarray(o, float) * ctx.sp for o in res.ostia_vox])
-            ax.scatter(P[:, 2], P[:, 1], P[:, 0], s=42, c="#111111",
-                       marker="D", depthshade=False)
-        if allv:
-            s = np.vstack(allv)
-            ax.set_xlim(s[:, 0].min(), s[:, 0].max())
-            ax.set_ylim(s[:, 1].min(), s[:, 1].max())
-            ax.set_zlim(s[:, 2].min(), s[:, 2].max())
-            try:
-                ax.set_box_aspect([np.ptp(s[:, i]) for i in range(3)])
-            except Exception:
-                pass
-        ax.view_init(elev=12, azim=-75)
-        ax.set_title(f"{res.name}\n{len(res.ostia_vox)} ostia · "
-                     f"{res.runtime:.1f}s · {res.note}", fontsize=9)
-        ax.set_axis_off()
-    fig.suptitle(f"{case_id} — eight independent branch detectors "
-                 f"(gold = believed branch voxels, black diamonds = ostia)",
-                 fontsize=14)
-    fig.tight_layout()
-    fig.savefig(path, dpi=125, facecolor="white")
-    plt.close(fig)
+def load_labels(path):
+    return sitk.GetArrayFromImage(sitk.ReadImage(path)).astype(np.int32)
 
 
-def fig_axial(results, ctx, path, case_id):
-    score = np.zeros(ctx.ct.shape[0])
-    for r in results:
-        for o in r.ostia_vox:
-            z = int(round(o[0]))
-            if 0 <= z < len(score):
-                score[max(z - 1, 0):z + 2] += 1
-    z_show = int(np.argmax(score)) if score.max() else ctx.ct.shape[0] // 2
-    n = len(results)
-    cols, rows = 4, int(np.ceil(n / 4))
-    fig, axes = plt.subplots(rows, cols, figsize=(3.7 * cols, 3.9 * rows),
-                             facecolor="black")
-    axes = np.atleast_1d(axes).ravel()
-    for k, res in enumerate(results):
-        ax = axes[k]
-        ax.imshow(window(ctx.ct[z_show]), cmap="gray", vmin=0, vmax=1,
-                  aspect=ctx.sy / ctx.sx)
-        ov = np.zeros(ctx.ct[z_show].shape + (4,), np.float32)
-        ov[res.mask[z_show] & ~ctx.mk[z_show]] = (1.0, 0.78, 0.25, 0.75)
-        ov[ctx.mk[z_show]] = (0.85, 0.29, 0.29, 0.45)
-        ax.imshow(ov, aspect=ctx.sy / ctx.sx, interpolation="nearest")
-        for o in res.ostia_vox:
-            if abs(o[0] - z_show) <= 2:
-                ax.plot(o[2], o[1], "D", ms=7, mfc="#00e5ff", mec="white", mew=1)
-        ax.set_title(f"{res.name}  ({len(res.ostia_vox)})", color="white",
-                     fontsize=10)
-        ax.axis("off")
-    for ax in axes[n:]:
-        ax.axis("off")
-    fig.suptitle(f"{case_id} — axial slice {z_show}, all methods", color="white",
-                 fontsize=13)
-    fig.tight_layout()
-    fig.savefig(path, dpi=125, facecolor="black")
-    plt.close(fig)
-
-
-def fig_agreement(results, ctx, path, case_id, tol_mm=6.0):
-    n = len(results)
-    M = np.zeros((n, n))
-    for i, a in enumerate(results):
-        A = [np.asarray(o, float) * ctx.sp for o in a.ostia_vox]
-        for j, b in enumerate(results):
-            B = [np.asarray(o, float) * ctx.sp for o in b.ostia_vox]
-            if not A or not B:
-                M[i, j] = np.nan
-                continue
-            M[i, j] = 100.0 * sum(
-                1 for p in A if min(np.linalg.norm(p - q) for q in B) <= tol_mm
-            ) / len(A)
-
-    fig, axes = plt.subplots(1, 3, figsize=(19, 6), facecolor="white",
-                             gridspec_kw={"width_ratios": [1.5, 1, 1]})
-    im = axes[0].imshow(M, cmap="viridis", vmin=0, vmax=100)
-    axes[0].set_xticks(range(n))
-    axes[0].set_yticks(range(n))
-    names = [r.name.split()[0] for r in results]
-    axes[0].set_xticklabels(names, rotation=45, ha="right", fontsize=9)
-    axes[0].set_yticklabels(names, fontsize=9)
-    for i in range(n):
-        for j in range(n):
-            if np.isfinite(M[i, j]):
-                axes[0].text(j, i, f"{M[i, j]:.0f}", ha="center", va="center",
-                             color="white" if M[i, j] < 60 else "black",
-                             fontsize=8)
-    axes[0].set_title("agreement: % of ROW's ostia found by COLUMN\n"
-                      f"(within {tol_mm:.0f} mm)", fontsize=11)
-    fig.colorbar(im, ax=axes[0], fraction=0.046)
-
-    axes[1].barh(names[::-1], [len(r.ostia_vox) for r in results][::-1],
-                 color="#4f86c6")
-    axes[1].set_title("ostia found", fontsize=11)
-    axes[1].grid(alpha=0.25, axis="x")
-
-    axes[2].barh(names[::-1], [r.runtime for r in results][::-1],
-                 color="#e07a5f")
-    axes[2].set_title("runtime (s)", fontsize=11)
-    axes[2].grid(alpha=0.25, axis="x")
-
-    fig.suptitle(f"{case_id} — method agreement. With no ground truth, an ostium "
-                 f"several independent methods find is your best evidence.",
-                 fontsize=13)
-    fig.tight_layout()
-    fig.savefig(path, dpi=130, facecolor="white")
-    plt.close(fig)
-    return M
-
-
-def fig_ostia_map(results, ctx, path, case_id):
-    """Every method's ostia on the unrolled aortic wall: angle vs slice."""
-    fig, ax = plt.subplots(figsize=(13, 8))
-    markers = "osD^vP*X"
-    for k, res in enumerate(results):
-        if not res.ostia_vox:
+def gt_ostia(gt_lab, ctx, min_label=2):
+    """Reference ostia: label 1 is the parent, every label >= 2 is a daughter."""
+    near = ndi.binary_dilation(ctx.mk, iterations=3)
+    out = []
+    for L in sorted(int(v) for v in np.unique(gt_lab) if v >= min_label):
+        comp = gt_lab == L
+        if not comp.any():
             continue
+        edt = ndi.distance_transform_edt(comp, sampling=tuple(ctx.sp))
+        contact = comp & near
+        pts = np.argwhere(contact if contact.any() else comp)
+        deep = pts[int(np.argmax(edt[tuple(pts.T)]))].astype(float)
+        out.append((L, ctx.snap_to_wall(deep), float(comp.sum()) * ctx.vox_mm3))
+    return out
+
+
+def score(results, ctx, refs, match_mm, outdir):
+    R = [np.asarray(o, float) * ctx.sp for _, o, _ in refs]
+    rows = []
+    for res in results:
+        P = [np.asarray(o, float) * ctx.sp for o in res.ostia_vox]
+        cand = sorted(((float(np.linalg.norm(p - r)), i, j)
+                       for i, p in enumerate(P) for j, r in enumerate(R)),
+                      key=lambda t: t[0])
+        tookP, tookR, hits = set(), set(), []
+        for dist, i, j in cand:
+            if dist > match_mm or i in tookP or j in tookR:
+                continue
+            tookP.add(i)
+            tookR.add(j)
+            hits.append(dist)
+        tp, fp, fn = len(hits), len(P) - len(hits), len(R) - len(hits)
+        prec, rec = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
+        rows.append(dict(method=res.name, tp=tp, fp=fp, fn=fn,
+                         precision=round(prec, 3), recall=round(rec, 3),
+                         f1=round(2 * prec * rec / max(prec + rec, 1e-9), 3),
+                         mean_ostium_err_mm=round(float(np.mean(hits)), 2)
+                         if hits else ""))
+    with open(os.path.join(outdir, "scores.csv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\n  SCORED against {len(R)} reference branches "
+          f"(match radius {match_mm:.0f} mm)")
+    print(f"  {'method':<18}{'TP':>4}{'FP':>4}{'FN':>4}{'prec':>7}{'rec':>7}"
+          f"{'F1':>7}{'err mm':>8}")
+    for r in sorted(rows, key=lambda q: -q["f1"]):
+        print(f"  {r['method']:<18}{r['tp']:>4}{r['fp']:>4}{r['fn']:>4}"
+              f"{r['precision']:>7.2f}{r['recall']:>7.2f}{r['f1']:>7.2f}"
+              f"{str(r['mean_ostium_err_mm']):>8}")
+    return rows
+
+
+# -----------------------------------------------------------------------------
+# figures
+# -----------------------------------------------------------------------------
+# per-method output: one folder each
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# per-method output: one folder each
+# -----------------------------------------------------------------------------
+
+def save_method(res, ctx, outdir, case_id):
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    d = os.path.join(outdir, res.name.replace(" ", "_"))
+    os.makedirs(d, exist_ok=True)
+
+    with open(os.path.join(d, "ostia.csv"), "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["id", "ostium_x_mm", "ostium_y_mm", "ostium_z_mm",
+                    "dir_x", "dir_y", "dir_z", "radius_mm"])
+        for k, (o, dr, rad) in enumerate(zip(res.ostia_vox, res.dirs,
+                                             res.radii), 1):
+            p_ = ctx.to_mm(o)
+            dd = ([round(float(dr[2]), 4), round(float(dr[1]), 4),
+                   round(float(dr[0]), 4)] if dr is not None else ["", "", ""])
+            w.writerow([f"branch_{k:03d}", round(p_[0], 2), round(p_[1], 2),
+                        round(p_[2], 2), *dd, round(rad, 3) if rad else ""])
+
+    ds = []
+    for k, (o, dr, rad) in enumerate(zip(res.ostia_vox, res.dirs, res.radii), 1):
+        p_ = ctx.to_mm(o)
+        v = ([float(dr[2]), float(dr[1]), float(dr[0])] if dr is not None
+             else [0.0, 0.0, 1.0])
+        v = list(np.round(np.array(v) / max(np.linalg.norm(v), 1e-9), 4))
+        ds.append({"instance_id": f"branch_{k:03d}",
+                   "parent_instance_id": "aorta",
+                   "ostium_xyz_mm": [round(float(q), 3) for q in p_],
+                   "seed_xyz_mm": [round(float(q), 3)
+                                   for q in (p_ + np.array(v) * 5.0)],
+                   "radius_mm": round(float(rad), 3) if rad else None,
+                   "direction_xyz": v})
+    with open(os.path.join(d, "prediction.json"), "w") as fh:
+        json.dump({"case_id": case_id, "parent": {"instance_id": "aorta"},
+                   "daughters": ds}, fh, indent=2)
+
+    meshes = []
+    av, af = fine_surface(ctx.mk, ctx.spacing, cap=120_000)
+    if av is not None:
+        meshes.append(dict(verts=ctx.verts_to_world(av), faces=af, name="aorta",
+                           color="#d94a4a", opacity=0.30, text="parent aorta"))
+    bv, bf = fine_surface(res.mask & ~ctx.mk, ctx.spacing, cap=90_000)
+    if bv is not None:
+        meshes.append(dict(verts=ctx.verts_to_world(bv), faces=bf,
+                           name="detected branches", color="#f2c14e",
+                           opacity=0.95, text=f"{res.name} branch voxels"))
+    if res.ostia_vox:
+        P = np.array([ctx.to_mm(o) for o in res.ostia_vox])
+        meshes.append(dict(kind="points", points=P, name="ostia",
+                           color="#111111", size=8,
+                           labels=[f"branch_{k:03d}"
+                                   for k in range(1, len(res.ostia_vox) + 1)]))
+    write_interactive_html(
+        os.path.join(d, "render.html"), meshes,
+        title=f"{case_id} - {res.name}",
+        subtitle=f"{len(res.ostia_vox)} ostia | {res.runtime:.1f}s | {res.note}")
+
+    fig = plt.figure(figsize=(16, 5.2), facecolor="white")
+    ax = fig.add_subplot(1, 3, 1, projection="3d")
+    allv = []
+    for binary, col, alpha in ((ctx.mk, "#d94a4a", 0.22),
+                               (res.mask & ~ctx.mk, "#f2c14e", 0.95)):
+        v, f = fine_surface(binary, ctx.spacing, cap=18_000)
+        if v is None:
+            continue
+        c = Poly3DCollection(v[f], alpha=alpha)
+        c.set_facecolor(col)
+        c.set_edgecolor("none")
+        ax.add_collection3d(c)
+        allv.append(v)
+    if res.ostia_vox:
+        P = np.array([np.asarray(o, float) * ctx.sp for o in res.ostia_vox])
+        ax.scatter(P[:, 2], P[:, 1], P[:, 0], s=55, c="#111111", marker="D",
+                   depthshade=False)
+    if allv:
+        st = np.vstack(allv)
+        ax.set_xlim(st[:, 0].min(), st[:, 0].max())
+        ax.set_ylim(st[:, 1].min(), st[:, 1].max())
+        ax.set_zlim(st[:, 2].min(), st[:, 2].max())
+        try:
+            ax.set_box_aspect([np.ptp(st[:, i]) for i in range(3)])
+        except Exception:
+            pass
+    ax.view_init(elev=12, azim=-75)
+    ax.set_title("branches (gold) on the aorta", fontsize=10)
+    ax.set_axis_off()
+
+    zc = np.zeros(ctx.ct.shape[0])
+    for o in res.ostia_vox:
+        z = int(round(o[0]))
+        if 0 <= z < len(zc):
+            zc[max(z - 1, 0):z + 2] += 1
+    z_show = int(np.argmax(zc)) if zc.max() else ctx.ct.shape[0] // 2
+    ax = fig.add_subplot(1, 3, 2)
+    ax.imshow(window(ctx.ct[z_show]), cmap="gray", vmin=0, vmax=1,
+              aspect=ctx.sy / ctx.sx)
+    ov = np.zeros(ctx.ct[z_show].shape + (4,), np.float32)
+    ov[res.mask[z_show] & ~ctx.mk[z_show]] = (1.0, 0.78, 0.25, 0.75)
+    ov[ctx.mk[z_show]] = (0.85, 0.29, 0.29, 0.45)
+    ax.imshow(ov, aspect=ctx.sy / ctx.sx, interpolation="nearest")
+    for o in res.ostia_vox:
+        if abs(o[0] - z_show) <= 2:
+            ax.plot(o[2], o[1], "D", ms=8, mfc="#00e5ff", mec="white", mew=1)
+    ax.set_title(f"axial slice {z_show}", fontsize=10)
+    ax.axis("off")
+
+    ax = fig.add_subplot(1, 3, 3)
+    if res.ostia_vox:
         A, Z = [], []
         for o in res.ostia_vox:
             z = int(round(o[0]))
@@ -1102,51 +1492,134 @@ def fig_ostia_map(results, ctx, path, case_id):
             cy, cx = ctx.cl[z]
             A.append(np.degrees(np.arctan2((o[1] - cy) * ctx.sy,
                                            (o[2] - cx) * ctx.sx)))
-            Z.append(o[0] * ctx.sz)
-        ax.scatter(A, Z, s=90, marker=markers[k % len(markers)], alpha=0.8,
-                   label=f"{res.name} ({len(A)})")
-    ax.set_xlabel("angle around the aorta (deg)   0 = +x, ±180 = -x")
-    ax.set_ylabel("position along z (mm)")
-    ax.invert_yaxis()
+            Z.append(ctx.to_mm(o)[2])
+        ax.scatter(A, Z, s=110, c="#f2c14e", edgecolors="#111", zorder=3)
+        for a, z, k in zip(A, Z, range(1, len(A) + 1)):
+            ax.annotate(f"{k:02d}", (a, z), fontsize=8, xytext=(6, 4),
+                        textcoords="offset points")
     ax.set_xlim(-185, 185)
-    ax.set_xticks([-180, -135, -90, -45, 0, 45, 90, 135, 180])
+    ax.set_xticks([-180, -90, 0, 90, 180])
+    ax.set_xlabel("angle around the aorta (deg)")
+    ax.set_ylabel("z (mm)")
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.01, 1.0))
-    ax.set_title(f"{case_id} — where each method puts its ostia.\n"
-                 f"Vertical clusters = several methods agreeing on one origin.",
-                 fontsize=12)
+    ax.set_title("ostia on the unrolled wall", fontsize=10)
+
+    fig.suptitle(f"{case_id} - {res.name}   |   {len(res.ostia_vox)} ostia   |   "
+                 f"{res.runtime:.1f}s   |   {res.note}", fontsize=12)
     fig.tight_layout()
-    fig.savefig(path, dpi=130, facecolor="white")
+    fig.savefig(os.path.join(d, "overview.png"), dpi=130, facecolor="white")
     plt.close(fig)
+    return d
 
 
 # -----------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--image", required=True)
     ap.add_argument("--aorta-mask", required=True)
     ap.add_argument("--outdir", default="bench")
     ap.add_argument("--case-id", default=None)
     ap.add_argument("--roi-mm", type=float, default=30.0)
-    ap.add_argument("--tol-mm", type=float, default=6.0,
-                    help="distance within which two methods count as agreeing")
-    ap.add_argument("--min-votes", type=int, default=3,
-                    help="methods that must agree for a consensus ostium")
-    ap.add_argument("--skip", default="", help="comma-separated method ids to "
-                                               "skip, e.g. M6,M5")
+    ap.add_argument("--mask-label", type=int, default=None,
+                    help="use only this label of the mask file as the parent")
+    ap.add_argument("--gt", default=None,
+                    help="multi-label ground truth (label 1 = aorta, >=2 = "
+                         "reference branches). Enables scoring.")
+    ap.add_argument("--gt-min-label", type=int, default=2)
+    ap.add_argument("--match-mm", type=float, default=10.0,
+                    help="a prediction counts as a hit within this distance")
+    ap.add_argument("--min-branch-mm3", type=float, default=15.0,
+                    help="smallest component treated as a branch")
+    ap.add_argument("--classic", action="store_true",
+                    help="restore the ORIGINAL behaviour: whole components with "
+                         "their wall junctions intact, symmetric HU band, 20/30 "
+                         "mm growth, 8 mL leak cap, no rim or eligibility "
+                         "filtering. Use this if the newer logic is worse.")
+    ap.add_argument("--core-mm", type=float, default=4.0,
+                    help="distance from the wall at which a structure counts as "
+                         "a branch shaft; shafts are grown back inward to "
+                         "recover their junctions (M3)")
+    ap.add_argument("--eligible-mm", type=float, default=None,
+                    help="a daughter must be followable this far beyond the "
+                         "wall (the task's own rule; default 5)")
+    ap.add_argument("--leak-ml", type=float, default=None,
+                    help="a grown component larger than this is treated as a "
+                         "leak into an organ and dropped")
+    ap.add_argument("--rim-mm", type=float, default=None,
+                    help="override the measured rim offset")
+    ap.add_argument("--band", default=None,
+                    help="override the measured HU band, e.g. 150,420")
+    ap.add_argument("--lumen-hu", default=None,
+                    help="override the automatic lumen model, e.g. 300,25 "
+                         "(centre,spread in HU). Use when the report warns that "
+                         "the mask contains dense outliers.")
+    ap.add_argument("--tol-mm", type=float, default=6.0)
+    ap.add_argument("--min-votes", type=int, default=3)
+    ap.add_argument("--skip", default="", help="e.g. M5,M6")
     args = ap.parse_args()
 
     case_id = args.case_id or os.path.basename(
         os.path.dirname(os.path.abspath(args.image))) or "case"
     os.makedirs(args.outdir, exist_ok=True)
 
-    img, _, ct, mk = load_case(args.image, args.aorta_mask)
-    ctx = Ctx(img, ct, mk, img.GetSpacing(), roi_mm=args.roi_mm)
     print(f"  branch_bench {__version__}")
-    print(f"  lumen {ctx.mu:.0f} +/- {ctx.sd:.0f} HU   band {ctx.lo:.0f}-{ctx.hi:.0f}"
-          f"   bone > {ctx.hi_cut:.0f}   crop {ctx.ct.shape}")
+    img, _, ct, mk = load_case(args.image, args.aorta_mask)
+    if args.mask_label is not None:
+        mk = (load_labels(args.aorta_mask) == args.mask_label).astype(np.uint8)
+        print(f"  parent = label {args.mask_label} only "
+              f"({int(mk.sum())} voxels)")
+    elif len(np.unique(load_labels(args.aorta_mask))) > 2:
+        print("  WARNING: the mask has several labels and they are being "
+              "MERGED. If labels >= 2 are branches, pass --mask-label 1, "
+              "otherwise they cannot be found.", file=sys.stderr)
+
+    cal = calibrate(
+        ct, mk, img.GetSpacing(),
+        override_lumen=(tuple(float(q) for q in args.lumen_hu.split(","))
+                        if args.lumen_hu else None),
+        override_rim=args.rim_mm,
+        override_band=(tuple(float(q) for q in args.band.split(","))
+                       if args.band else None),
+        min_branch_mm3=args.min_branch_mm3)
+    if args.classic:
+        # exactly the settings the original run used, before any later change
+        cal.classic = True
+        cal.lo = cal.centre - 2.5 * cal.spread
+        cal.hi = cal.centre + 2.5 * cal.spread
+        cal.bone_hu = max(400.0, cal.centre + 3.0 * cal.spread)
+        cal.rim_mm = 0.0
+        cal.rim_note = "classic: no rim handling"
+        cal.min_branch_mm3 = 8.0
+        cal.eligible_mm = 0.0
+        cal.leak_mL = 8.0
+    # explicit overrides win over --classic, so a hand-set band still applies
+    if args.band:
+        cal.lo, cal.hi = (float(q) for q in args.band.split(","))
+    if args.lumen_hu:
+        c_, s_ = (float(q) for q in args.lumen_hu.split(","))
+        cal.centre, cal.spread = c_, s_
+        if not args.band:
+            cal.lo, cal.hi = c_ - 2.5 * s_, c_ + 2.5 * s_
+        cal.bone_hu = max(cal.hi + 40.0, 350.0)
+    if args.leak_ml:
+        cal.leak_mL = args.leak_ml
+    if args.eligible_mm:
+        cal.eligible_mm = args.eligible_mm
+    for line in cal.lines():
+        print("  " + line)
+    with open(os.path.join(args.outdir, "calibration.txt"), "w") as fh:
+        fh.write(f"{case_id}\n" + "\n".join(cal.lines()) + "\n")
+
+    ctx = Ctx(img, ct, mk, img.GetSpacing(), cal, roi_mm=args.roi_mm)
+    zs = np.where(ctx.mk.any(axis=(1, 2)))[0]
+    print(f"  aorta mask       : {ctx.mk.sum() * ctx.vox_mm3 / 1000:.1f} mL, "
+          f"{len(zs)} slices, {len(zs) * ctx.sz:.0f} mm long")
+    print(f"  search region    : "
+          f"{ctx.roi.sum() * ctx.vox_mm3 / 1000:.1f} mL   "
+          f"bone excluded {ctx.bone.sum() * ctx.vox_mm3 / 1000:.0f} mL\n")
 
     skip = {s.strip().upper() for s in args.skip.split(",") if s.strip()}
     plan = [("M1", m1_frangi), ("M2", m2_band_connect), ("M3", m3_expansion),
@@ -1156,113 +1629,57 @@ def main():
     results = []
     for mid, fn in plan:
         if mid in skip:
-            print(f"  {mid} skipped")
             continue
         try:
-            r = fn(ctx)
-            r = dedupe(drop_end_caps(r, ctx), ctx)
+            r = dedupe(drop_end_caps(
+                (fn(ctx, core_mm=args.core_mm) if fn is m3_expansion
+                 else fn(ctx)), ctx), ctx)
             results.append(r)
-            print(f"  {r.name:<18} {len(r.ostia_vox):>3} ostia  "
-                  f"{r.runtime:>6.1f}s  {r.note}")
         except Exception as exc:
             print(f"  {mid} FAILED: {exc}", file=sys.stderr)
 
     cons, votes = m8_consensus(results, ctx, args.tol_mm, args.min_votes)
     results.append(cons)
-    print(f"  {cons.name:<18} {len(cons.ostia_vox):>3} ostia  {cons.note}")
+
+    # agreement, for the one summary table
+    n = len(results)
+    M = np.full((n, n), np.nan)
+    for i, a in enumerate(results):
+        A = [np.asarray(o, float) * ctx.sp for o in a.ostia_vox]
+        for j, b in enumerate(results):
+            B = [np.asarray(o, float) * ctx.sp for o in b.ostia_vox]
+            if A and B:
+                M[i, j] = 100.0 * sum(
+                    1 for p in A
+                    if min(np.linalg.norm(p - q) for q in B) <= args.tol_mm) / len(A)
+
+    with open(os.path.join(args.outdir, "summary.csv"), "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["method", "n_ostia", "runtime_s", "note", "mean_agreement_pct"])
+        for i, r in enumerate(results):
+            row = M[i][np.arange(n) != i]
+            w.writerow([r.name, len(r.ostia_vox), round(r.runtime, 2), r.note,
+                        round(float(np.nanmean(row)), 1)
+                        if np.isfinite(row).any() else ""])
+
+    if args.gt:
+        refs = gt_ostia(load_labels(args.gt)[ctx.region], ctx, args.gt_min_label)
+        print(f"\n  ground truth: {len(refs)} branches "
+              f"({', '.join(f'L{L}:{v:.0f}mm3' for L, _, v in refs)})")
+        if refs:
+            score(results, ctx, refs, args.match_mm, args.outdir)
+
+    for r in results:
+        d = save_method(r, ctx, args.outdir, case_id)
+        print(f"  {r.name:<18} {len(r.ostia_vox):>3} ostia  {r.runtime:>6.1f}s  "
+              f"-> {os.path.basename(d)}/")
+
+    print(f"\n  consensus ostia (>= {args.min_votes} methods):")
     for o, v in zip(cons.ostia_vox, votes):
         p = ctx.to_mm(o)
-        print(f"      ({p[0]:8.1f},{p[1]:8.1f},{p[2]:9.1f}) mm  <- {', '.join(v)}")
-
-    # ---- tables ----
-    with open(os.path.join(args.outdir, "methods_ostia.csv"), "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["method", "ostium_x_mm", "ostium_y_mm", "ostium_z_mm",
-                    "dir_x", "dir_y", "dir_z", "radius_mm"])
-        for r in results:
-            for o, d, rad in zip(r.ostia_vox, r.dirs, r.radii):
-                p = ctx.to_mm(o)
-                dd = ([round(float(d[2]), 4), round(float(d[1]), 4),
-                       round(float(d[0]), 4)] if d is not None else ["", "", ""])
-                w.writerow([r.name, round(p[0], 2), round(p[1], 2), round(p[2], 2),
-                            *dd, round(rad, 3) if rad else ""])
-
-    M = fig_agreement(results, ctx, os.path.join(args.outdir,
-                                                 "22_methods_agreement.png"),
-                      case_id, args.tol_mm)
-    with open(os.path.join(args.outdir, "methods_summary.csv"), "w",
-              newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["method", "n_ostia", "runtime_s", "note",
-                    "mean_agreement_pct"])
-        for i, r in enumerate(results):
-            row = M[i][np.arange(len(results)) != i]
-            w.writerow([r.name, len(r.ostia_vox), round(r.runtime, 2), r.note,
-                        round(float(np.nanmean(row)), 1) if np.isfinite(row).any()
-                        else ""])
-
-    # ---- challenge JSON per method ----
-    for r in results:
-        ds = []
-        for k, (o, d, rad) in enumerate(zip(r.ostia_vox, r.dirs, r.radii), 1):
-            p = ctx.to_mm(o)
-            vec = ([float(d[2]), float(d[1]), float(d[0])] if d is not None
-                   else [0.0, 0.0, 1.0])
-            vec = list(np.round(np.array(vec) / max(np.linalg.norm(vec), 1e-9), 4))
-            ds.append({"instance_id": f"branch_{k:03d}",
-                       "parent_instance_id": "aorta",
-                       "ostium_xyz_mm": [round(float(v), 3) for v in p],
-                       "seed_xyz_mm": [round(float(v), 3)
-                                       for v in (p + np.array(vec) * 5.0)],
-                       "radius_mm": round(float(rad), 3) if rad else None,
-                       "direction_xyz": vec})
-        tag = r.name.split()[0].lower()
-        with open(os.path.join(args.outdir, f"pred_{tag}.json"), "w") as fh:
-            json.dump({"case_id": case_id, "parent": {"instance_id": "aorta"},
-                       "daughters": ds}, fh, indent=2)
-
-    # ---- figures ----
-    for name, fn in [("20_methods_3d.png", fig_3d),
-                     ("21_methods_axial.png", fig_axial),
-                     ("23_methods_ostia_map.png", fig_ostia_map)]:
-        try:
-            fn(results, ctx, os.path.join(args.outdir, name), case_id)
-            print(f"  wrote {os.path.join(args.outdir, name)}")
-        except Exception as exc:
-            print(f"  FAILED {name}: {exc}", file=sys.stderr)
-
-    # ---- interactive ----
-    meshes = []
-    av, af = fine_surface(ctx.mk, ctx.spacing, cap=120_000)
-    if av is not None:
-        meshes.append(dict(verts=ctx.verts_to_world(av), faces=af, name="aorta",
-                           color="#d94a4a", opacity=0.3, text="parent aorta"))
-    palette = ["#f2c14e", "#2f9e9e", "#7b6cd9", "#e07a5f", "#3fa34d",
-               "#c85b9b", "#4f86c6", "#111111"]
-    for k, r in enumerate(results):
-        bv, bf = fine_surface(r.mask & ~ctx.mk, ctx.spacing, cap=90_000)
-        if bv is None:
-            continue
-        meshes.append(dict(verts=ctx.verts_to_world(bv), faces=bf,
-                           name=f"{r.name} ({len(r.ostia_vox)} ostia)",
-                           color=palette[k % len(palette)], opacity=0.9,
-                           visible=(r.name.startswith("M8")),
-                           text=f"<b>{r.name}</b><br>{len(r.ostia_vox)} ostia<br>"
-                                f"{r.runtime:.1f}s<br>{r.note}"))
-        if r.ostia_vox:
-            P = np.array([ctx.to_mm(o) for o in r.ostia_vox])
-            meshes.append(dict(kind="points", points=P,
-                               name=f"{r.name} ostia", color=palette[k % len(palette)],
-                               size=7,
-                               labels=[f"{r.name} ostium" for _ in r.ostia_vox]))
-    write_interactive_html(
-        os.path.join(args.outdir, "methods_interactive.html"), meshes,
-        title=f"{case_id} — eight branch detectors",
-        subtitle="Consensus is shown first. Click legend entries to bring in the "
-                 "individual methods and see where they disagree.",
-        axis_note="")
-
-    print(f"\n  done -> {args.outdir}/")
+        print(f"    ({p[0]:8.1f},{p[1]:8.1f},{p[2]:9.1f}) mm  <- {', '.join(v)}")
+    print(f"\n  {args.outdir}/summary.csv  +  one folder per method "
+          f"(ostia.csv, prediction.json, render.html, overview.png)")
 
 
 if __name__ == "__main__":
