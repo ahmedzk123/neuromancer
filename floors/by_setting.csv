@@ -1,9 +1,0 @@
-setting,method,tol_mm,n_cases,mean_f1,mean_precision,mean_recall,mean_err_mm
-sd:3,M3 expansion,5.0,5,0.5323,0.4482,0.7167,2.153
-sd:3+r5,M3 expansion,5.0,5,0.5098,0.5833,0.55,2.213
-sd:3+f230,M3 expansion,5.0,5,0.5067,0.6483,0.5333,2.342
-sd:3+f230+r5,M3 expansion,5.0,5,0.599,0.7833,0.5333,2.342
-sd:3+f250,M3 expansion,5.0,5,0.5048,0.5691,0.5333,2.212
-sd:3+f250+r5,M3 expansion,5.0,5,0.5457,0.6833,0.5,2.133
-sd:3+f280,M3 expansion,5.0,5,0.378,0.3433,0.5,2.127
-sd:3+f280+r5,M3 expansion,5.0,5,0.3976,0.3867,0.4333,2.335

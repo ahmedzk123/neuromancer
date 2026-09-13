@@ -1,4 +1,0 @@
-instance_id,parent_instance_id,ostium_x_mm,ostium_y_mm,ostium_z_mm,seed_x_mm,seed_y_mm,seed_z_mm,dir_x,dir_y,dir_z,radius_mm
-branch_001,aorta,9.58,31.44,-984.04,13.4,32.84,-986.95,0.7642,0.2785,-0.5818,2.147
-branch_002,aorta,19.75,34.57,-994.44,15.67,32.04,-995.84,-0.8152,-0.507,-0.28,1.174
-branch_003,aorta,10.36,28.32,-1019.24,8.6,31.9,-1016.23,-0.3517,0.7166,0.6023,

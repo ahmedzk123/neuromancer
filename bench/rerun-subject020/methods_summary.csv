@@ -1,9 +1,0 @@
-method,n_ostia,runtime_s,note,mean_agreement_pct
-M1 frangi,0,0.27,thr=0.216,
-M2 band_connect,0,0.06,band 420-582 HU,
-M3 expansion,3,0.06,0 leak(s) blocked,33.3
-M4 wall_flux,0,0.01,thr 453 HU,
-M5 escape,15,0.17,cost<18.0,6.7
-M6 oof,0,0.16,thr=20.095,
-M7 bulge,0,0.01,dev > 2.0 sd (2.83 mm),
-M8 consensus,0,0.0,>=3 methods agree,

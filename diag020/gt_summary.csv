@@ -1,5 +1,0 @@
-name,label,n_voxels,volume_mm3,frac_inside_mask,gap_mm,bridge_min_hu,reach_mm,from_caudal_mm,from_cranial_mm,end_cap_dropped,hu_min,hu_p10,hu_p50,hu_p90,hu_max,hu_p50_minus_lumen,hu_p10_within_5mm,frac_in_bone_mask,floor_for_5mm,floor_for_10mm,ostium_x_mm,ostium_y_mm,ostium_z_mm
-label_2,2,18,60.75,0.0,1.5,306.0,3.354,27.0,39.0,False,268.0,296.9,403.5,473.7,525.0,-99.5,296.9,0.0,,,22.56,-144.44,344.0
-label_3,3,17,57.375,0.0,1.5,415.0,6.364,22.5,43.5,False,262.0,264.6,302.0,460.8,507.0,-201.0,264.2,0.0,380.0,,10.56,-133.94,339.5
-label_4,4,18,60.75,0.0,1.5,293.0,7.348,39.0,27.0,False,227.0,234.5,285.0,370.4,376.0,-218.0,237.2,0.0,260.0,,9.06,-126.44,356.0
-label_5,5,15,50.625,0.0,1.5,291.0,6.874,42.0,24.0,False,259.0,265.6,377.0,425.4,480.0,-126.0,267.6,0.0,260.0,,13.56,-124.94,359.0

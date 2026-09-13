@@ -1,8 +1,0 @@
-{
-  "case_id": "subject019",
-  "method": "M4 wall_flux",
-  "parent": {
-    "instance_id": "aorta"
-  },
-  "daughters": []
-}
