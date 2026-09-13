@@ -1,0 +1,89 @@
+{
+  "case_id": "subject001",
+  "method": "M4 wall_flux",
+  "parent": {
+    "instance_id": "aorta"
+  },
+  "daughters": [
+    {
+      "instance_id": "branch_001",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        19.747,
+        35.353,
+        -996.04
+      ],
+      "seed_xyz_mm": [
+        19.747,
+        35.353,
+        -991.04
+      ],
+      "radius_mm": null,
+      "direction_xyz": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "instance_id": "branch_002",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        9.581,
+        30.661,
+        -988.04
+      ],
+      "seed_xyz_mm": [
+        9.581,
+        30.661,
+        -983.04
+      ],
+      "radius_mm": null,
+      "direction_xyz": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "instance_id": "branch_003",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        15.055,
+        30.661,
+        -976.84
+      ],
+      "seed_xyz_mm": [
+        15.055,
+        30.661,
+        -971.84
+      ],
+      "radius_mm": null,
+      "direction_xyz": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "instance_id": "branch_004",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        15.837,
+        32.225,
+        -958.44
+      ],
+      "seed_xyz_mm": [
+        15.837,
+        32.225,
+        -953.44
+      ],
+      "radius_mm": null,
+      "direction_xyz": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  ]
+}

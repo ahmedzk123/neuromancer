@@ -1,0 +1,5 @@
+method,n_ostia,runtime_s,note
+M1 frangi,0,0.34,thr=0.217
+M2 band_connect,1,0.05,band 250-631 HU
+M3 expansion,4,0.07,0 leak(s) blocked
+M4 wall_flux,0,0.01,thr 434 HU

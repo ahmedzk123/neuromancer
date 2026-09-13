@@ -1,0 +1,8 @@
+{
+  "case_id": "subject019",
+  "method": "M1 frangi",
+  "parent": {
+    "instance_id": "aorta"
+  },
+  "daughters": []
+}

@@ -1,0 +1,7 @@
+k_sd,lo_hu,hi_hu,width_hu,n_ostia,n_components,grown_mL,largest_comp_mL,max_reach_mm,median_radius_mm,runtime_s,note
+1.5,268.7,335.5,66.8,13,15,5.86,2.47,30.0,0.6,0.94,0 leak(s) blocked
+2.0,257.6,346.6,89.0,11,13,7.57,6.6,30.0,0.73,0.66,0 leak(s) blocked
+2.5,246.5,357.8,111.3,9,11,9.03,8.17,30.0,0.75,0.58,0 leak(s) blocked
+3.0,235.3,368.9,133.6,8,8,0.99,0.33,29.9,0.78,0.59,1 leak(s) blocked
+3.5,224.2,380.0,155.8,7,8,2.8,2.12,30.0,0.47,0.58,1 leak(s) blocked
+4.0,213.1,391.1,178.1,5,5,0.45,0.08,16.6,0.65,0.52,1 leak(s) blocked

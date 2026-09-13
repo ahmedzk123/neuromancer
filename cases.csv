@@ -1,0 +1,3 @@
+case_id,image,aorta_mask,gt
+subject019,TORALIS CHALLENGE/subject019/orig19.nii.gz,TORALIS CHALLENGE/subject019/mask19.nii.gz,TORALIS CHALLENGE/subject019/aorta_and_daughters19_draft.nii.gz
+subject021,TORALIS CHALLENGE/subject021/orig21.nii.gz,TORALIS CHALLENGE/subject021/mask21.nii.gz,TORALIS CHALLENGE/subject021/aorta_and_daughters21_draft.nii.gz

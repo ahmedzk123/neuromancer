@@ -1,0 +1,89 @@
+{
+  "case_id": "subject019",
+  "method": "M3 expansion",
+  "parent": {
+    "instance_id": "aorta"
+  },
+  "daughters": [
+    {
+      "instance_id": "branch_001",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        9.134,
+        -165.866,
+        266.6
+      ],
+      "seed_xyz_mm": [
+        13.951,
+        -164.602,
+        267.038
+      ],
+      "radius_mm": 1.265,
+      "direction_xyz": [
+        0.9635,
+        0.2528,
+        0.0876
+      ]
+    },
+    {
+      "instance_id": "branch_002",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        18.134,
+        -185.366,
+        299.6
+      ],
+      "seed_xyz_mm": [
+        18.203,
+        -186.973,
+        304.334
+      ],
+      "radius_mm": 0.36,
+      "direction_xyz": [
+        0.0139,
+        -0.3214,
+        0.9468
+      ]
+    },
+    {
+      "instance_id": "branch_003",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        3.134,
+        -168.866,
+        304.1
+      ],
+      "seed_xyz_mm": [
+        3.134,
+        -168.866,
+        309.1
+      ],
+      "radius_mm": null,
+      "direction_xyz": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "instance_id": "branch_004",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        19.634,
+        -183.866,
+        287.6
+      ],
+      "seed_xyz_mm": [
+        19.634,
+        -183.866,
+        292.6
+      ],
+      "radius_mm": null,
+      "direction_xyz": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  ]
+}
