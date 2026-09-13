@@ -1,0 +1,5 @@
+setting,method,tol_mm,n_cases,mean_f1,mean_precision,mean_recall,mean_err_mm
+sd:3+r5,M1 frangi,5.0,5,0.2032,0.2333,0.2,2.96
+sd:3+r5,M2 band_connect,5.0,5,0.3055,0.36,0.2667,2.101
+sd:3+r5,M3 expansion,5.0,5,0.5098,0.5833,0.55,2.213
+sd:3+r5,M4 wall_flux,5.0,5,0.1,0.2,0.0667,3.177

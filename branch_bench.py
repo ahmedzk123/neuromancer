@@ -449,7 +449,7 @@ class Ctx:
     """Everything the methods share: cropped volumes, geometry, intensity model."""
 
     def __init__(self, img, ct, mk, spacing, margin_mm=45.0, roi_mm=30.0,
-                 band_rule="sd", k_sd=2.5, min_reach_mm=0.0):
+                 band_rule="sd", k_sd=2.5, min_reach_mm=0.0, floor_hu=None):
         self.img, self.spacing = img, spacing
         self.band_rule, self.k_sd = band_rule, k_sd
         self.min_reach_mm = min_reach_mm
@@ -467,6 +467,13 @@ class Ctx:
 
         self.lo, self.hi, self.mu, self.sd = lumen_band(
             ct, mk, k_sd=k_sd, spacing=spacing, rule=band_rule)
+        # Override ONLY the floor, leaving the ceiling and the bone cut exactly
+        # as the sd rule computed them. The required floor measured per subject
+        # is 246 / <=300 / <=260 / <=260 on 001 / 019 / 020 / 023, while
+        # mean - 3*sd hands those cases 235 / 289 / 404 / 286 -- so the floor is
+        # the one term that must stop being a multiple of sd.
+        if floor_hu is not None:
+            self.lo = float(floor_hu)
         v2 = (band_rule == "v2")
         # Take the LOWER of the old cut and the ceiling-relative one, so v2 can
         # never exclude less bone by threshold than the current code does.
@@ -845,6 +852,9 @@ def main():
     ap.add_argument("--outdir", default="bench")
     ap.add_argument("--case-id", default=None)
     ap.add_argument("--roi-mm", type=float, default=30.0)
+    ap.add_argument("--floor-hu", type=float, default=None,
+                    help="absolute lower edge of the band in HU, overriding "
+                         "mean - k*sd. Ceiling and bone cut are untouched.")
     ap.add_argument("--min-reach-mm", type=float, default=0.0,
                     help="discard candidates that never get this far beyond "
                          "the aortic wall (the challenge's own 5 mm "
@@ -868,7 +878,7 @@ def main():
     img, _, ct, mk = load_case(args.image, args.aorta_mask)
     ctx = Ctx(img, ct, mk, img.GetSpacing(), roi_mm=args.roi_mm,
               band_rule=args.band, k_sd=args.k_sd,
-              min_reach_mm=args.min_reach_mm)
+              min_reach_mm=args.min_reach_mm, floor_hu=args.floor_hu)
     tag = args.band + (f":{args.k_sd:g}" if args.band == "sd" else "")
     print(f"  lumen {ctx.mu:.0f} +/- {ctx.sd:.0f} HU   "
           f"band {ctx.lo:.0f}-{ctx.hi:.0f} [{tag}]   "

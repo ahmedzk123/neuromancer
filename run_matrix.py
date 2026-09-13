@@ -179,6 +179,11 @@ def main():
     ap.add_argument("--case", action="append",
                     help="id,image,aorta_mask,gt  (repeatable)")
     ap.add_argument("--settings", default="sd:2.5,sd:3.0")
+    ap.add_argument("--floors", default="auto",
+                    help="absolute band floors in HU as a third axis, e.g. "
+                         "'auto,250,280'. 'auto' keeps mean - k*sd. Only the "
+                         "floor moves; ceiling and bone cut are untouched. "
+                         "Shown as '+f250'.")
     ap.add_argument("--min-reach", default="0",
                     help="comma-separated eligibility floors in mm, as a "
                          "second axis: '0,5' scores every band setting with "
@@ -199,6 +204,8 @@ def main():
     cases = read_cases(args)
     settings = parse_settings(args.settings)
     reaches = [float(s) for s in args.min_reach.split(",") if s.strip()]
+    floors = [None if s.strip().lower() in ("auto", "none", "")
+              else float(s) for s in args.floors.split(",") if s.strip()]
     want = [m.strip().upper() for m in args.methods.split(",") if m.strip()]
     tols = sorted({float(s) for s in args.tolerances.split(",") if s.strip()}
                   | {args.tol_mm})
@@ -223,15 +230,19 @@ def main():
             ctx = bb.Ctx(img, ct, mk, img.GetSpacing(), roi_mm=args.roi_mm,
                          band_rule=rule)
             base_lo, base_hi = ctx.lo, ctx.hi
-            for (r2, k), reach in [((r, k), q)
-                                   for r, k in settings if r == rule
-                                   for q in reaches]:
+            for (r2, k), floor, reach in [((r, k), f, q)
+                                          for r, k in settings if r == rule
+                                          for f in floors for q in reaches]:
                 if rule == "sd" and k is not None:
                     ctx.lo, ctx.hi = ctx.mu - k * ctx.sd, ctx.mu + k * ctx.sd
                 else:
                     ctx.lo, ctx.hi = base_lo, base_hi
+                if floor is not None:          # floor only; ceiling untouched
+                    ctx.lo = float(floor)
                 ctx.min_reach_mm = reach
-                sname = setting_name(r2, k) + (f"+r{reach:g}" if reach else "")
+                sname = (setting_name(r2, k)
+                         + (f"+f{floor:g}" if floor is not None else "")
+                         + (f"+r{reach:g}" if reach else ""))
                 print(f"     {sname:<11} band {ctx.lo:7.0f}-{ctx.hi:<7.0f}",
                       end="")
 
@@ -280,8 +291,10 @@ def main():
 
     # ---- aggregate ---------------------------------------------------------
     case_ids = [c[0] for c in cases]
-    snames = [setting_name(r, k) + (f"+r{q:g}" if q else "")
-              for r, k in settings for q in reaches]
+    snames = [setting_name(r, k)
+              + (f"+f{f:g}" if f is not None else "")
+              + (f"+r{q:g}" if q else "")
+              for r, k in settings for f in floors for q in reaches]
     by_setting = {}
     for sname in snames:
         for m in method_names:
