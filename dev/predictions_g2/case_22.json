@@ -1,0 +1,546 @@
+{
+  "case_id": "case_22",
+  "annotation_status": "automatic_prediction",
+  "coordinate_system": "SimpleITK physical LPS millimetres",
+  "parent": {
+    "instance_id": "aorta"
+  },
+  "shape_xyz": [
+    247,
+    247,
+    280
+  ],
+  "spacing_xyz_mm": [
+    1.5,
+    1.5,
+    1.5
+  ],
+  "policy": {
+    "minimum_origin_diameter_mm": 2.0,
+    "minimum_visible_path_mm": 5.0,
+    "maximum_trace_mm": 10.0,
+    "stop_at_first_bifurcation": true,
+    "wall_definition": "boundary of supplied parent lumen mask",
+    "diameter_resolution_warning": "1.50 mm voxels; borderline 2.0 mm eligibility is uncertain"
+  },
+  "method": {
+    "detector": "two-phase band growth with leak detection (Tahoces-style)",
+    "band_hu": [
+      230.0,
+      355.2
+    ],
+    "band_rule": "floor absolute, ceiling mean + 3 sd",
+    "lumen_mean_hu": 250.7,
+    "lumen_sd_hu": 34.8,
+    "bone_cut_hu": 400.0,
+    "leaks_blocked": 0,
+    "runtime_s": {
+      "load": 1.88,
+      "detect": 0.94,
+      "trace": 0.09,
+      "total": 2.9
+    }
+  },
+  "daughters": [
+    {
+      "instance_id": "branch_001",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        14.638,
+        -152.862,
+        320.6
+      ],
+      "seed_xyz_mm": [
+        16.21,
+        -154.578,
+        322.457
+      ],
+      "radius_mm": 3.967,
+      "direction_xyz": [
+        0.4932,
+        -0.5352,
+        0.6857
+      ],
+      "label_value": 1,
+      "centerline_xyz_mm": [
+        [
+          14.638,
+          -152.862,
+          320.6
+        ],
+        [
+          14.841,
+          -152.981,
+          320.684
+        ],
+        [
+          14.909,
+          -153.06,
+          320.896
+        ],
+        [
+          14.855,
+          -153.209,
+          321.084
+        ],
+        [
+          14.79,
+          -153.366,
+          321.268
+        ],
+        [
+          14.726,
+          -153.523,
+          321.451
+        ],
+        [
+          14.714,
+          -153.625,
+          321.646
+        ],
+        [
+          14.824,
+          -153.595,
+          321.868
+        ],
+        [
+          14.935,
+          -153.565,
+          322.09
+        ],
+        [
+          15.08,
+          -153.618,
+          322.232
+        ],
+        [
+          15.268,
+          -153.778,
+          322.269
+        ],
+        [
+          15.456,
+          -153.938,
+          322.307
+        ],
+        [
+          15.645,
+          -154.098,
+          322.344
+        ],
+        [
+          15.833,
+          -154.258,
+          322.382
+        ],
+        [
+          16.021,
+          -154.418,
+          322.419
+        ],
+        [
+          16.21,
+          -154.578,
+          322.457
+        ]
+      ],
+      "centerline_length_mm": 3.662,
+      "stopped_at_first_bifurcation": true,
+      "seed_truncated_to_path_end": true,
+      "origin_diameter_estimate_mm": 6.616,
+      "origin_diameter_method": "max(2 x inscribed radius at the ostium, area-equivalent diameter on a perpendicular plane 1.5 mm along the path)",
+      "radius_measurement_status": "search_envelope_limited",
+      "radius_method": "Area-equivalent radius sqrt(area/pi) on a 0.25 mm interpolated plane perpendicular to the path at the seed; parent-lumen voxels excluded.",
+      "threshold_hu": 230.0,
+      "search_radius_mm": 5.011,
+      "voxel_count": 363,
+      "volume_mm3": 1225.125,
+      "traced_voxel_count": 30
+    },
+    {
+      "instance_id": "branch_002",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        17.638,
+        -151.362,
+        335.6
+      ],
+      "seed_xyz_mm": [
+        16.762,
+        -154.821,
+        336.689
+      ],
+      "radius_mm": 3.042,
+      "direction_xyz": [
+        -0.2787,
+        -0.8893,
+        0.3627
+      ],
+      "label_value": 2,
+      "centerline_xyz_mm": [
+        [
+          17.638,
+          -151.362,
+          335.6
+        ],
+        [
+          17.577,
+          -151.539,
+          335.754
+        ],
+        [
+          17.495,
+          -151.605,
+          335.968
+        ],
+        [
+          17.386,
+          -151.793,
+          336.092
+        ],
+        [
+          17.276,
+          -151.98,
+          336.217
+        ],
+        [
+          17.166,
+          -152.167,
+          336.341
+        ],
+        [
+          17.057,
+          -152.354,
+          336.465
+        ],
+        [
+          16.892,
+          -152.535,
+          336.507
+        ],
+        [
+          16.724,
+          -152.71,
+          336.549
+        ],
+        [
+          16.57,
+          -152.79,
+          336.729
+        ],
+        [
+          16.417,
+          -152.871,
+          336.91
+        ],
+        [
+          16.264,
+          -152.951,
+          337.09
+        ],
+        [
+          16.283,
+          -153.097,
+          337.24
+        ],
+        [
+          16.393,
+          -153.278,
+          337.373
+        ],
+        [
+          16.492,
+          -153.464,
+          337.464
+        ],
+        [
+          16.534,
+          -153.678,
+          337.342
+        ],
+        [
+          16.577,
+          -153.892,
+          337.219
+        ],
+        [
+          16.619,
+          -154.106,
+          337.097
+        ],
+        [
+          16.662,
+          -154.32,
+          336.975
+        ],
+        [
+          16.705,
+          -154.534,
+          336.853
+        ],
+        [
+          16.747,
+          -154.748,
+          336.731
+        ],
+        [
+          16.79,
+          -154.962,
+          336.609
+        ]
+      ],
+      "centerline_length_mm": 5.164,
+      "stopped_at_first_bifurcation": true,
+      "seed_truncated_to_path_end": false,
+      "origin_diameter_estimate_mm": 6.693,
+      "origin_diameter_method": "max(2 x inscribed radius at the ostium, area-equivalent diameter on a perpendicular plane 1.5 mm along the path)",
+      "radius_measurement_status": "search_envelope_limited",
+      "radius_method": "Area-equivalent radius sqrt(area/pi) on a 0.25 mm interpolated plane perpendicular to the path at the seed; parent-lumen voxels excluded.",
+      "threshold_hu": 230.0,
+      "search_radius_mm": 4.646,
+      "voxel_count": 212,
+      "volume_mm3": 715.5,
+      "traced_voxel_count": 59
+    },
+    {
+      "instance_id": "branch_003",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        4.138,
+        -142.362,
+        313.1
+      ],
+      "seed_xyz_mm": [
+        0.606,
+        -142.537,
+        311.419
+      ],
+      "radius_mm": 1.382,
+      "direction_xyz": [
+        -0.9024,
+        -0.0089,
+        -0.4309
+      ],
+      "label_value": 3,
+      "centerline_xyz_mm": [
+        [
+          4.138,
+          -142.362,
+          313.1
+        ],
+        [
+          3.93,
+          -142.501,
+          313.1
+        ],
+        [
+          3.722,
+          -142.64,
+          313.1
+        ],
+        [
+          3.514,
+          -142.778,
+          313.1
+        ],
+        [
+          3.306,
+          -142.917,
+          313.1
+        ],
+        [
+          3.098,
+          -143.056,
+          313.1
+        ],
+        [
+          2.947,
+          -143.245,
+          313.1
+        ],
+        [
+          2.77,
+          -143.352,
+          313.1
+        ],
+        [
+          2.521,
+          -143.33,
+          313.1
+        ],
+        [
+          2.272,
+          -143.309,
+          313.1
+        ],
+        [
+          2.023,
+          -143.287,
+          313.1
+        ],
+        [
+          1.773,
+          -143.265,
+          313.1
+        ],
+        [
+          1.563,
+          -143.175,
+          313.013
+        ],
+        [
+          1.359,
+          -143.073,
+          312.911
+        ],
+        [
+          1.155,
+          -142.971,
+          312.808
+        ],
+        [
+          1.059,
+          -142.899,
+          312.594
+        ],
+        [
+          0.972,
+          -142.83,
+          312.37
+        ],
+        [
+          0.886,
+          -142.761,
+          312.146
+        ],
+        [
+          0.8,
+          -142.692,
+          311.922
+        ],
+        [
+          0.714,
+          -142.623,
+          311.697
+        ],
+        [
+          0.627,
+          -142.554,
+          311.473
+        ],
+        [
+          0.541,
+          -142.485,
+          311.249
+        ],
+        [
+          0.455,
+          -142.416,
+          311.024
+        ],
+        [
+          0.361,
+          -142.403,
+          310.877
+        ],
+        [
+          0.239,
+          -142.585,
+          310.998
+        ],
+        [
+          0.118,
+          -142.767,
+          311.119
+        ],
+        [
+          -0.003,
+          -142.948,
+          311.241
+        ],
+        [
+          -0.124,
+          -143.13,
+          311.362
+        ],
+        [
+          -0.246,
+          -143.312,
+          311.483
+        ],
+        [
+          -0.368,
+          -143.495,
+          311.6
+        ],
+        [
+          -0.524,
+          -143.69,
+          311.6
+        ],
+        [
+          -0.679,
+          -143.841,
+          311.589
+        ],
+        [
+          -0.825,
+          -143.659,
+          311.498
+        ],
+        [
+          -0.97,
+          -143.477,
+          311.408
+        ],
+        [
+          -1.116,
+          -143.296,
+          311.317
+        ],
+        [
+          -1.261,
+          -143.114,
+          311.226
+        ],
+        [
+          -1.407,
+          -142.932,
+          311.135
+        ],
+        [
+          -1.552,
+          -142.75,
+          311.044
+        ],
+        [
+          -1.698,
+          -142.568,
+          310.953
+        ],
+        [
+          -1.843,
+          -142.386,
+          310.862
+        ],
+        [
+          -1.821,
+          -142.571,
+          310.808
+        ]
+      ],
+      "centerline_length_mm": 9.774,
+      "stopped_at_first_bifurcation": false,
+      "seed_truncated_to_path_end": false,
+      "origin_diameter_estimate_mm": 3.0,
+      "origin_diameter_method": "max(2 x inscribed radius at the ostium, area-equivalent diameter on a perpendicular plane 1.5 mm along the path)",
+      "radius_measurement_status": "search_envelope_limited",
+      "radius_method": "Area-equivalent radius sqrt(area/pi) on a 0.25 mm interpolated plane perpendicular to the path at the seed; parent-lumen voxels excluded.",
+      "threshold_hu": 230.0,
+      "search_radius_mm": 3.449,
+      "voxel_count": 27,
+      "volume_mm3": 91.125,
+      "traced_voxel_count": 27
+    }
+  ]
+}

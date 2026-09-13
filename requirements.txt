@@ -1,4 +1,10 @@
-numpy==2.5.3
-SimpleITK==2.5.6
-scipy==1.18.1
-scikit-image==0.26.0
+# CPU only. No GPU, no network at run time.
+SimpleITK>=2.3,<3
+numpy>=1.24,<3
+scipy>=1.10
+scikit-image>=0.21
+
+# Needed only for check.html, the visual verification view. If plotly is absent
+# the pipeline still runs and still writes prediction.json, daughters.nii.gz,
+# snap_labels.txt and ostia.csv -- the view is skipped.
+plotly>=5.18

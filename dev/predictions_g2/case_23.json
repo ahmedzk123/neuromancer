@@ -1,0 +1,286 @@
+{
+  "case_id": "case_23",
+  "annotation_status": "automatic_prediction",
+  "coordinate_system": "SimpleITK physical LPS millimetres",
+  "parent": {
+    "instance_id": "aorta"
+  },
+  "shape_xyz": [
+    244,
+    244,
+    179
+  ],
+  "spacing_xyz_mm": [
+    1.5,
+    1.5,
+    1.5
+  ],
+  "policy": {
+    "minimum_origin_diameter_mm": 2.0,
+    "minimum_visible_path_mm": 5.0,
+    "maximum_trace_mm": 10.0,
+    "stop_at_first_bifurcation": true,
+    "wall_definition": "boundary of supplied parent lumen mask",
+    "diameter_resolution_warning": "1.50 mm voxels; borderline 2.0 mm eligibility is uncertain"
+  },
+  "method": {
+    "detector": "two-phase band growth with leak detection (Tahoces-style)",
+    "band_hu": [
+      230.0,
+      477.6
+    ],
+    "band_rule": "floor absolute, ceiling mean + 3 sd",
+    "lumen_mean_hu": 381.9,
+    "lumen_sd_hu": 31.9,
+    "bone_cut_hu": 477.6,
+    "leaks_blocked": 0,
+    "runtime_s": {
+      "load": 0.89,
+      "detect": 0.25,
+      "trace": 0.03,
+      "total": 1.17
+    }
+  },
+  "daughters": [
+    {
+      "instance_id": "branch_001",
+      "parent_instance_id": "aorta",
+      "ostium_xyz_mm": [
+        6.143,
+        -141.857,
+        260.5
+      ],
+      "seed_xyz_mm": [
+        2.334,
+        -143.357,
+        260.5
+      ],
+      "radius_mm": 0.719,
+      "direction_xyz": [
+        -0.9961,
+        -0.0247,
+        -0.0853
+      ],
+      "label_value": 1,
+      "centerline_xyz_mm": [
+        [
+          6.143,
+          -141.857,
+          260.5
+        ],
+        [
+          6.143,
+          -142.034,
+          260.677
+        ],
+        [
+          6.143,
+          -142.211,
+          260.854
+        ],
+        [
+          6.143,
+          -142.388,
+          261.03
+        ],
+        [
+          6.143,
+          -142.565,
+          261.207
+        ],
+        [
+          5.964,
+          -142.652,
+          261.205
+        ],
+        [
+          5.728,
+          -142.711,
+          261.146
+        ],
+        [
+          5.493,
+          -142.77,
+          261.088
+        ],
+        [
+          5.257,
+          -142.829,
+          261.029
+        ],
+        [
+          5.021,
+          -142.888,
+          260.97
+        ],
+        [
+          4.786,
+          -142.947,
+          260.911
+        ],
+        [
+          4.55,
+          -143.006,
+          260.852
+        ],
+        [
+          4.314,
+          -143.065,
+          260.793
+        ],
+        [
+          4.078,
+          -143.123,
+          260.734
+        ],
+        [
+          3.843,
+          -143.182,
+          260.675
+        ],
+        [
+          3.607,
+          -143.241,
+          260.616
+        ],
+        [
+          3.371,
+          -143.3,
+          260.557
+        ],
+        [
+          3.135,
+          -143.357,
+          260.5
+        ],
+        [
+          2.885,
+          -143.357,
+          260.5
+        ],
+        [
+          2.635,
+          -143.357,
+          260.5
+        ],
+        [
+          2.385,
+          -143.357,
+          260.5
+        ],
+        [
+          2.135,
+          -143.357,
+          260.5
+        ],
+        [
+          1.885,
+          -143.357,
+          260.5
+        ],
+        [
+          1.643,
+          -143.357,
+          260.493
+        ],
+        [
+          1.643,
+          -143.357,
+          260.243
+        ],
+        [
+          1.643,
+          -143.357,
+          259.993
+        ],
+        [
+          1.635,
+          -143.357,
+          259.75
+        ],
+        [
+          1.385,
+          -143.357,
+          259.75
+        ],
+        [
+          1.135,
+          -143.357,
+          259.75
+        ],
+        [
+          0.888,
+          -143.353,
+          259.754
+        ],
+        [
+          0.744,
+          -143.209,
+          259.899
+        ],
+        [
+          0.6,
+          -143.064,
+          260.043
+        ],
+        [
+          0.455,
+          -142.92,
+          260.187
+        ],
+        [
+          0.311,
+          -142.776,
+          260.332
+        ],
+        [
+          0.167,
+          -142.631,
+          260.476
+        ],
+        [
+          0.143,
+          -142.46,
+          260.647
+        ],
+        [
+          0.143,
+          -142.283,
+          260.824
+        ],
+        [
+          0.143,
+          -142.107,
+          261.001
+        ],
+        [
+          0.143,
+          -141.93,
+          261.178
+        ],
+        [
+          0.143,
+          -141.857,
+          261.398
+        ],
+        [
+          0.143,
+          -141.857,
+          261.648
+        ]
+      ],
+      "centerline_length_mm": 9.906,
+      "stopped_at_first_bifurcation": false,
+      "seed_truncated_to_path_end": false,
+      "origin_diameter_estimate_mm": 3.0,
+      "origin_diameter_method": "max(2 x inscribed radius at the ostium, area-equivalent diameter on a perpendicular plane 1.5 mm along the path)",
+      "radius_measurement_status": "approximate_threshold_estimate",
+      "radius_method": "Area-equivalent radius sqrt(area/pi) on a 0.25 mm interpolated plane perpendicular to the path at the seed; parent-lumen voxels excluded.",
+      "threshold_hu": 230.0,
+      "search_radius_mm": 3.75,
+      "voxel_count": 41,
+      "volume_mm3": 138.375,
+      "traced_voxel_count": 15
+    }
+  ]
+}

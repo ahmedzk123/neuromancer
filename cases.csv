@@ -1,0 +1,6 @@
+case_id,image,aorta_mask,ref
+case_19,EVAL_SET/case_19/orig19.nii.gz,EVAL_SET/case_19/aorta19.nii.gz,EVAL_SET/case_19/annotation_ref.json
+case_20,EVAL_SET/case_20/orig20.nii.gz,EVAL_SET/case_20/aorta20.nii.gz,EVAL_SET/case_20/annotation_ref.json
+case_21,EVAL_SET/case_21/orig21.nii.gz,EVAL_SET/case_21/aorta21.nii.gz,EVAL_SET/case_21/annotation_ref.json
+case_22,EVAL_SET/case_22/orig22.nii.gz,EVAL_SET/case_22/aorta22.nii.gz,EVAL_SET/case_22/annotation_ref.json
+case_23,EVAL_SET/case_23/orig23.nii.gz,EVAL_SET/case_23/aorta23.nii.gz,EVAL_SET/case_23/annotation_ref.json

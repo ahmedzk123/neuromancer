@@ -1,55 +1,82 @@
 """
-detector.py -- frozen daughter-artery detector.
+detector.py -- the FROZEN detector.
 
-Configuration: k_sd=3.0 ceiling, floor_hu=230 (absolute), min_reach_mm=5.0.
-Validated on 5 annotated cases (EVAL_SET): pooled P=0.77, R=0.53, F1=0.63,
-mean ostium error 2.34mm, 0.05-0.19s/case. See README.md for the regression
-table this must keep reproducing.
+Configuration: sd:3 + absolute floor 230 HU + 5 mm reach, validated across five
+annotated subjects. Every constant below is a measured choice. Do not tune them
+without re-running score.py on the development set.
 
-Method, in order:
-  1. crop to the aorta mask's bounding box, padded 45mm
-  2. lumen model: erode mask 2mm in-plane, mu/sd = mean/std of CT inside
-  3. band: floor_hu (absolute) to mu + k_sd*sd (relative)
-  4. bone exclusion: > max(400, mu+3*sd), close x2, fill holes, dilate 2mm
-  5. two-phase growth (Tahoces-style): grow to 20mm, block any component
-     over leak_mL as organ leakage, regrow to 30mm avoiding blocked regions
-  6. connected components >= 8mm3 -> one ostium each
-  7. eligibility: reach >= min_reach_mm beyond the wall, origin diameter >= 2mm
-  8. proximal trace: skeletonize the component, walk from the ostium, stop at
-     10mm or the first real bifurcation (spurs under 1.5mm are pruned as
-     skeletonization noise, not counted as forks)
-  9. seed = point at 5mm arc-length along the trace; radius = local EDT value
-     at the seed; direction = least-squares fit through the trace
-  10. drop candidates within 6mm of the mask's cropped cranial/caudal end;
-      merge candidates closer than 6mm
+Pipeline (steps as specified):
+  1 crop            bounding box of the aorta mask, padded 45 mm
+  2 lumen model     erode mask 2 mm, mu = mean, sd = std of the CT inside
+  3 band            [230 HU, mu + 3*sd]   -- floor ABSOLUTE, ceiling relative
+  4 bone exclusion  > max(400, mu + 3*sd), close x2, fill holes, dilate 2 mm
+  5 growth          two-phase: 20 mm, flag components > 8 mL as leaks, regrow 30 mm
+  6 candidates      components >= 8 mm3; ostium = contact voxel maximising the
+                    component distance transform
+  7 eligibility     discard candidates never reaching 5 mm beyond the wall
+  8 post            drop ostia within 6 mm of the mask ends; merge within 6 mm
+
+The ostium POSITION comes from here. The seed, direction, radius and origin
+diameter come from trace.py, which implements the challenge's own proximal-trace
+rule (<=10 mm or first bifurcation).
 """
+
 from __future__ import annotations
 
 import numpy as np
+import SimpleITK as sitk
 from scipy import ndimage as ndi
-from skimage.morphology import skeletonize
 
-K_SD = 3.0
-FLOOR_HU = 230.0
-MIN_RECH_MM = 5.0
-MIN_ORIGIN_DIAM_MM = 2.0
-MIN_COMPONENT_MM3 = 8.0
-PHASE1_MM = 20.0
-PHASE2_MM = 30.0
-LEAK_ML = 8.0
-TRACE_MAX_MM = 10.0
-SEED_ARC_MM = 5.0
-SPUR_PRUNE_MM = 1.5
-END_CAP_MARGIN_MM = 6.0
-DEDUPE_MERGE_MM = 6.0
-CROP_MARGIN_MM = 45.0
-ERODE_MM = 2.0
-BONE_HI_SD = 3.0
-BONE_DILATE_MM = 2.0
+__all__ = ["Config", "Case", "detect"]
 
+
+# -----------------------------------------------------------------------------
+# frozen constants
+# -----------------------------------------------------------------------------
+
+class Config:
+    """Every number the detector uses. Frozen; exposed so run.py can print it."""
+
+    # step 1
+    margin_mm = 45.0
+    # step 2
+    erode_mm = 2.0
+    # step 3
+    k_sd = 3.0
+    floor_hu = 230.0            # absolute lower edge; NOT mu - k*sd
+    # step 4
+    bone_floor_hu = 400.0       # actual cut is max(this, mu + bone_k_sd*sd)
+    bone_k_sd = 3.0
+    bone_dilate_mm = 2.0
+    # step 5
+    phase1_mm = 20.0
+    phase2_mm = 30.0
+    leak_mL = 8.0
+    # step 6
+    min_component_mm3 = 8.0
+    max_candidates = 25
+    # step 7
+    min_reach_mm = 5.0
+    # challenge eligibility: origin must be at least 2 mm across. Measured after
+    # tracing, in run.py, because the diameter comes from the proximal path.
+    min_origin_diameter_mm = 2.0
+    # step 8
+    end_margin_mm = 6.0
+    merge_mm = 6.0
+
+    def as_dict(self):
+        return {k: v for k, v in vars(type(self)).items()
+                if not k.startswith("_") and isinstance(v, (int, float))}
+
+
+# -----------------------------------------------------------------------------
+# I/O and case geometry
+# -----------------------------------------------------------------------------
 
 def _mask_bbox(mk, pad_vox):
-    idx = np.where(mk)
+    idx = np.where(mk > 0)
+    if len(idx[0]) == 0:
+        return tuple(slice(0, s) for s in mk.shape)
     out = []
     for ax in range(3):
         lo = max(int(idx[ax].min()) - pad_vox[ax], 0)
@@ -58,130 +85,142 @@ def _mask_bbox(mk, pad_vox):
     return tuple(out)
 
 
-class Ctx:
-    """Cropped volumes + the measured intensity model, shared by every step."""
+class Case:
+    """One CT + aorta mask, cropped, with the intensity and bone models built.
 
-    def __init__(self, img, ct, mk, spacing,
-                 k_sd=K_SD, floor_hu=FLOOR_HU, min_reach_mm=MIN_RECH_MM):
-        self.img = img
-        sx, sy, sz = spacing
-        self.sx, self.sy, self.sz = sx, sy, sz
-        self.sp = np.array([sz, sy, sx])           # (z,y,x) mm-per-voxel, matches array order
-        self.vox_mm3 = sx * sy * sz
-        self.min_reach_mm = min_reach_mm
+    Array axes are [z, y, x]; `sp` is the matching (dz, dy, dx) spacing in mm.
+    `to_mm` is the only place voxel indices become physical coordinates, and it
+    goes through SimpleITK so origin, spacing and direction are all honoured.
+    """
 
-        pad = (int(round(CROP_MARGIN_MM / sz)), int(round(CROP_MARGIN_MM / sy)),
-               int(round(CROP_MARGIN_MM / sx)))
+    def __init__(self, image_path, mask_path, cfg=Config()):
+        self.cfg = cfg
+        self.img = sitk.ReadImage(str(image_path))
+        self.msk = sitk.ReadImage(str(mask_path))
+        if self.img.GetSize() != self.msk.GetSize():
+            raise ValueError(f"Grid mismatch: image {self.img.GetSize()} vs "
+                             f"mask {self.msk.GetSize()}.")
+
+        ct = sitk.GetArrayFromImage(self.img).astype(np.float32)
+        mk = (sitk.GetArrayFromImage(self.msk) > 0)
+        self.full_shape = ct.shape
+        self.spacing = self.img.GetSpacing()                  # (sx, sy, sz)
+        sx, sy, sz = self.spacing
+        self.sp = np.array([sz, sy, sx], float)
+        self.vox_mm3 = float(sx * sy * sz)
+
+        # --- step 2: lumen model, on the FULL volume (not the crop) ----------
+        er = max(int(round(cfg.erode_mm / min(sx, sy))), 1)
+        core = ndi.binary_erosion(mk, iterations=er)
+        if core.sum() < 50:
+            core = mk
+        lumen = ct[core]
+        self.mu = float(lumen.mean())
+        self.sd = float(lumen.std())
+
+        # --- step 1: crop ----------------------------------------------------
+        pad = (int(round(cfg.margin_mm / sz)), int(round(cfg.margin_mm / sy)),
+               int(round(cfg.margin_mm / sx)))
         self.region = _mask_bbox(mk, pad)
         self.ct = ct[self.region]
         self.mk = mk[self.region]
-        self.z0 = self.region[0].start
-        self.y0 = self.region[1].start
-        self.x0 = self.region[2].start
+        self.z0 = self.region[0].start or 0
+        self.y0 = self.region[1].start or 0
+        self.x0 = self.region[2].start or 0
 
-        # -- lumen model: erode 2mm IN-PLANE only (matches x/y resolution, not z) --
-        er_iter = max(int(round(ERODE_MM / min(sx, sy))), 1)
-        core = ndi.binary_erosion(self.mk, iterations=er_iter)
-        if core.sum() < 50:
-            core = self.mk
-        lumen = self.ct[core]
-        self.mu, self.sd = float(lumen.mean()), float(lumen.std())
+        # --- step 3: band ----------------------------------------------------
+        self.lo = float(cfg.floor_hu)
+        self.hi = self.mu + cfg.k_sd * self.sd
 
-        # -- band: absolute floor, relative ceiling --
-        self.lo = float(floor_hu)
-        self.hi = self.mu + k_sd * self.sd
-
-        # -- bone exclusion --
-        self.dist_out = ndi.distance_transform_edt(~self.mk, sampling=(sz, sy, sx))
-        hi_cut = max(400.0, self.mu + BONE_HI_SD * self.sd)
-        bone = ndi.binary_closing(self.ct > hi_cut, iterations=2)
+        # --- step 4: bone ----------------------------------------------------
+        self.dist_out = ndi.distance_transform_edt(~self.mk, sampling=self.sp)
+        self.bone_cut = max(cfg.bone_floor_hu, self.mu + cfg.bone_k_sd * self.sd)
+        bone = ndi.binary_closing(self.ct > self.bone_cut, iterations=2)
         bone = ndi.binary_fill_holes(bone)
-        bit = max(int(round(BONE_DILATE_MM / min(sx, sy))), 1)
-        self.bone = ndi.binary_dilation(bone, iterations=bit)
+        it = max(int(round(cfg.bone_dilate_mm / min(sx, sy))), 1)
+        self.bone = ndi.binary_dilation(bone, iterations=it)
 
-        self.wall = (ndi.binary_dilation(self.mk, iterations=1)
-                     & ~ndi.binary_erosion(self.mk, iterations=1))
+        self.band = (self.ct >= self.lo) & (self.ct <= self.hi) & ~self.bone
+
+    # -- coordinates ---------------------------------------------------------
 
     def to_mm(self, vox_zyx):
-        """voxel (z,y,x) in the crop -> physical (x,y,z) mm."""
+        """Crop voxel (z, y, x), possibly fractional -> physical (x, y, z) mm.
+
+        Fractional indices are handled by interpolating between the physical
+        points of the two bracketing integer indices along each axis, which is
+        exact for an affine index->physical map and keeps sub-voxel centreline
+        points honest.
+        """
         v = np.asarray(vox_zyx, float)
-        return np.array(self.img.TransformIndexToPhysicalPoint((
-            int(round(v[2])) + self.x0, int(round(v[1])) + self.y0,
-            int(round(v[0])) + self.z0)), float)
+        base = np.floor(v).astype(int)
+        frac = v - base
+        o = np.array(self.img.TransformIndexToPhysicalPoint(
+            (int(base[2]) + self.x0, int(base[1]) + self.y0,
+             int(base[0]) + self.z0)), float)
+        out = o.copy()
+        for ax, step in ((2, (1, 0, 0)), (1, (0, 1, 0)), (0, (0, 0, 1))):
+            if frac[ax] == 0.0:
+                continue
+            p = np.array(self.img.TransformIndexToPhysicalPoint(
+                (int(base[2]) + self.x0 + step[0],
+                 int(base[1]) + self.y0 + step[1],
+                 int(base[0]) + self.z0 + step[2])), float)
+            out = out + (p - o) * frac[ax]
+        return out
 
-    def to_mm_continuous(self, vox_zyx):
-        """Same as to_mm but sub-voxel (for interpolated points along a trace)."""
+    def full_index(self, vox_zyx):
+        """Crop voxel -> index in the original, uncropped volume."""
         v = np.asarray(vox_zyx, float)
-        return np.array(self.img.TransformContinuousIndexToPhysicalPoint((
-            v[2] + self.x0, v[1] + self.y0, v[0] + self.z0)), float)
-
-    def mm_to_vox_continuous(self, xyz_mm):
-        """Inverse of to_mm_continuous: physical mm -> crop-local (z,y,x) voxel."""
-        xx, yy, zz = self.img.TransformPhysicalPointToContinuousIndex(
-            tuple(float(v) for v in xyz_mm))
-        return np.array([zz - self.z0, yy - self.y0, xx - self.x0], float)
+        return np.array([v[0] + self.z0, v[1] + self.y0, v[2] + self.x0])
 
 
-def grow_expansion(ctx):
-    """Two-phase Tahoces-style growth with leak detection. Returns (mask, n_leaks)."""
-    band = (ctx.ct >= ctx.lo) & (ctx.ct <= ctx.hi) & ~ctx.bone
+# -----------------------------------------------------------------------------
+# steps 5-8
+# -----------------------------------------------------------------------------
 
-    def grow(limit_mm, blocked):
-        allowed = band & (ctx.dist_out <= limit_mm) & ~blocked
-        lab, _ = ndi.label(allowed | ctx.mk)
-        touch = set(int(v) for v in np.unique(lab[ctx.mk]) if v > 0)
-        return np.isin(lab, list(touch)) & ~ctx.mk
+def _grow(case, limit_mm, blocked):
+    allowed = case.band & (case.dist_out <= limit_mm) & ~blocked
+    lab, _ = ndi.label(allowed | case.mk)
+    touch = [int(v) for v in np.unique(lab[case.mk]) if v > 0]
+    return np.isin(lab, touch) & ~case.mk
 
-    g1 = grow(PHASE1_MM, np.zeros_like(band))
+
+def _two_phase_growth(case):
+    """Step 5. Grow to 20 mm, block components that blow up, regrow to 30 mm."""
+    cfg = case.cfg
+    zeros = np.zeros_like(case.band)
+    g1 = _grow(case, cfg.phase1_mm, zeros)
     lab1, n1 = ndi.label(g1)
-    blocked = np.zeros_like(band)
-    n_leak = 0
+    blocked, n_leak = zeros, 0
     if n1:
-        sizes = np.bincount(lab1.ravel()) * ctx.vox_mm3 / 1000.0
-        leaks = [i for i in range(1, n1 + 1) if sizes[i] > LEAK_ML]
+        mL = np.bincount(lab1.ravel()) * case.vox_mm3 / 1000.0
+        leaks = [i for i in range(1, n1 + 1) if mL[i] > cfg.leak_mL]
         n_leak = len(leaks)
         if leaks:
             blocked = np.isin(lab1, leaks)
-
-    g2 = grow(PHASE2_MM, blocked)
-    return g2, n_leak
+    return _grow(case, cfg.phase2_mm, blocked), n_leak
 
 
-def _components(mask, ctx, min_mm3=MIN_COMPONENT_MM3):
-    lab, _ = ndi.label(mask)
-    sizes = np.bincount(lab.ravel())
-    sizes[0] = 0
-    min_vox = max(int(min_mm3 / ctx.vox_mm3), 1)
-    keep = [int(i) for i in np.argsort(sizes)[::-1] if sizes[i] >= min_vox]
-    return lab, keep
+def _link_to_aorta(pts_vox, dist_out, axis_mm, sp, sub_mk,
+                   max_gap_mm=15.0, step_mm=0.4, hit_mm=0.9, end_mm=6.0,
+                   patch_mm=4.0):
+    """Step 6 fallback: march a detached component's local axis back to the wall.
 
-
-def _link_to_aorta(pts_vox, ctx, axis_mm, max_gap_mm=15.0, step_mm=0.4,
-                   hit_mm=0.9, end_mm=6.0, patch_mm=4.0):
-    """March from a candidate's aorta-facing END along its LOCAL axis to the
-    wall (ported unchanged from the validated algorithm).
-
-    Three things matter for where the ostium lands: start from the CENTROID
-    of the near end, not the single nearest voxel; use the axis of just the
-    near end, not the whole component (a curved vessel's global axis points
-    nowhere useful); once the ray hits, snap to the centre of the local wall
-    patch, which is what "centre of the opening" means.
+    Starts from the CENTROID of the aorta-facing end and uses that end's own
+    axis, because a curving branch's global axis points nowhere useful.
     """
-    sp = ctx.sp
     pts_mm = pts_vox * sp
-    d_here = ctx.dist_out[tuple(pts_vox.T.astype(int))]
+    d_here = dist_out[tuple(pts_vox.T.astype(int))]
     near_i = int(np.argmin(d_here))
-
     dsel = np.linalg.norm(pts_mm - pts_mm[near_i], axis=1) <= end_mm
     if dsel.sum() >= 4:
         end_pts = pts_mm[dsel]
         start_mm = end_pts.mean(axis=0)
-        c = end_pts - start_mm
-        _, _, vv = np.linalg.svd(c, full_matrices=False)
+        _, _, vv = np.linalg.svd(end_pts - start_mm, full_matrices=False)
         u = vv[0]
     else:
-        start_mm = pts_mm[near_i]
-        u = np.asarray(axis_mm, float)
+        start_mm, u = pts_mm[near_i], np.asarray(axis_mm, float)
     u = u / max(np.linalg.norm(u), 1e-9)
     p0 = start_mm / sp
 
@@ -190,16 +229,18 @@ def _link_to_aorta(pts_vox, ctx, axis_mm, max_gap_mm=15.0, step_mm=0.4,
         prev = None
         for t in np.arange(step_mm, max_gap_mm + step_mm, step_mm):
             p = p0 + sign * u * t / sp
-            if np.any(p < 0) or np.any(p >= np.array(ctx.dist_out.shape) - 1):
+            if np.any(p < 0) or np.any(p >= np.array(dist_out.shape) - 1):
                 break
-            d = float(ndi.map_coordinates(ctx.dist_out, p[:, None], order=1)[0])
+            d = float(ndi.map_coordinates(dist_out, p[:, None], order=1)[0])
             if prev is not None and d > prev + 0.6:
                 break
             prev = d
             if d <= hit_mm:
                 if t < best[1]:
                     ost = p
-                    wp = np.argwhere(ctx.wall).astype(float)
+                    wall = (ndi.binary_dilation(sub_mk, iterations=1)
+                            & ~ndi.binary_erosion(sub_mk, iterations=1))
+                    wp = np.argwhere(wall).astype(float)
                     if len(wp):
                         dd = np.linalg.norm((wp - p) * sp, axis=1)
                         loc = wp[dd <= patch_mm]
@@ -207,229 +248,91 @@ def _link_to_aorta(pts_vox, ctx, axis_mm, max_gap_mm=15.0, step_mm=0.4,
                             ost = loc.mean(axis=0)
                     best = (True, float(t), ost)
                 break
-    return best[2] if best[0] else None
+    return best
 
 
-def _find_ostium(comp, ctx, edt_full):
-    """Contact-zone voxel maximising distance to the grown mask's edge (Tahoces),
-    falling back to marching the component's local axis back to the wall."""
-    near_wall = ndi.binary_dilation(ctx.mk, iterations=2)
-    contact = comp & near_wall
-    if contact.any():
-        cpts = np.argwhere(contact)
-        best = cpts[int(np.argmax(edt_full[tuple(cpts.T)]))]
-        return best.astype(float)
+def _candidates(case, grown):
+    """Steps 6 and 7. One ostium per eligible component.
 
-    pts = np.argwhere(comp).astype(float)
-    pmm = pts * ctx.sp
-    cen = pmm - pmm.mean(axis=0)
-    step = max(len(cen) // 4000, 1)
-    _, _, vv = np.linalg.svd(cen[::step], full_matrices=False)
-    axis = vv[0]
-    ost = _link_to_aorta(pts, ctx, axis)
-    return np.asarray(ost, float) if ost is not None else None
+    Returns a list of dicts with the component label and the ostium in crop
+    voxel coordinates, largest component first.
+    """
+    cfg = case.cfg
+    lab, n = ndi.label(grown)
+    if n == 0:
+        return lab, []
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    min_vox = max(int(cfg.min_component_mm3 / case.vox_mm3), 1)
+    order = [int(i) for i in np.argsort(sizes)[::-1] if sizes[i] >= min_vox]
 
+    edt = ndi.distance_transform_edt(grown, sampling=tuple(case.sp))
+    near_wall = ndi.binary_dilation(case.mk, iterations=2)
 
-def _skeleton_graph(skel):
-    pts = [tuple(p) for p in np.argwhere(skel)]
-    pt_set = set(pts)
-    offsets = [(dz, dy, dx) for dz in (-1, 0, 1) for dy in (-1, 0, 1)
-               for dx in (-1, 0, 1) if (dz, dy, dx) != (0, 0, 0)]
-    graph = {}
-    for p in pts:
-        graph[p] = [tuple(np.add(p, o)) for o in offsets
-                    if tuple(np.add(p, o)) in pt_set]
-    return graph
-
-
-def _prune_spurs(graph, ctx, min_len_mm=SPUR_PRUNE_MM):
-    """Remove short leaf twigs (skeletonization noise) before bifurcation-testing."""
-    graph = {k: list(v) for k, v in graph.items()}
-    changed = True
-    while changed:
-        changed = False
-        leaves = [p for p, nbrs in graph.items() if len(nbrs) == 1]
-        for leaf in leaves:
-            if leaf not in graph:
+    out = []
+    for i in order[:cfg.max_candidates]:
+        comp = lab == i
+        # step 7: eligibility -- must leave the wall by at least 5 mm
+        if float(case.dist_out[comp].max()) < cfg.min_reach_mm:
+            continue
+        contact = comp & near_wall
+        if contact.any():
+            cp = np.argwhere(contact)
+            ost = cp[int(np.argmax(edt[tuple(cp.T)]))].astype(float)
+        else:
+            pts = np.argwhere(comp).astype(float)
+            pmm = pts * case.sp
+            cen = pmm - pmm.mean(axis=0)
+            st = max(len(cen) // 4000, 1)
+            _, _, vv = np.linalg.svd(cen[::st], full_matrices=False)
+            hit, _gap, ost = _link_to_aorta(pts, case.dist_out, vv[0],
+                                            case.sp, case.mk)
+            if not hit or ost is None:
                 continue
-            path = [leaf]
-            cur, prev = leaf, None
-            length = 0.0
-            while True:
-                nbrs = [n for n in graph.get(cur, []) if n != prev]
-                if len(nbrs) != 1:
-                    break
-                nxt = nbrs[0]
-                length += float(np.linalg.norm(
-                    (np.array(nxt) - np.array(cur)) * ctx.sp))
-                path.append(nxt)
-                prev, cur = cur, nxt
-                if len(graph.get(cur, [])) != 2:
-                    break
-            if length < min_len_mm and len(graph.get(cur, [])) > 2:
-                for p in path[:-1]:                # drop the twig, keep the fork node
-                    for n in graph.get(p, []):
-                        if p in graph.get(n, []):
-                            graph[n].remove(p)
-                    del graph[p]
-                changed = True
-    return graph
+            ost = np.asarray(ost, float)
+        out.append({"label": i, "ostium_vox": ost,
+                    "n_voxels": int(comp.sum()),
+                    "volume_mm3": float(comp.sum()) * case.vox_mm3})
+    return lab, out
 
 
-def _trace_proximal(comp, ostium_vox, ctx):
-    """Skeletonize, prune noise spurs, walk from the ostium to 10mm or a fork.
-
-    Returns a list of (z,y,x) voxel points from the ostium outward, or just
-    [ostium_vox] if no usable skeleton exists.
-    """
-    skel = skeletonize(comp)
-    if not skel.any():
-        return [tuple(int(round(v)) for v in ostium_vox)]
-    graph = _skeleton_graph(skel)
-    graph = _prune_spurs(graph, ctx)
-    if not graph:
-        return [tuple(int(round(v)) for v in ostium_vox)]
-
-    pts = np.array(list(graph.keys()))
-    d = np.linalg.norm((pts - np.asarray(ostium_vox)) * ctx.sp, axis=1)
-    start = tuple(pts[int(np.argmin(d))])
-
-    path = [start]
-    cur, prev, cum_mm = start, None, 0.0
-    while True:
-        nbrs = [n for n in graph.get(cur, []) if n != prev]
-        if len(nbrs) != 1:
-            break                                   # dead end or real bifurcation
-        nxt = nbrs[0]
-        step_mm = float(np.linalg.norm((np.array(nxt) - np.array(cur)) * ctx.sp))
-        if cum_mm + step_mm > TRACE_MAX_MM:
-            break                                    # truncate at 10mm
-        cum_mm += step_mm
-        path.append(nxt)
-        prev, cur = cur, nxt
-    return path
-
-
-def _arc_length_point(path_mm, target_mm):
-    """Point at `target_mm` arc-length along path_mm; clamps to the path end."""
-    if len(path_mm) < 2:
-        return path_mm[0], target_mm == 0
-    cum = 0.0
-    for a, b in zip(path_mm, path_mm[1:]):
-        seg = float(np.linalg.norm(b - a))
-        if cum + seg >= target_mm:
-            t = (target_mm - cum) / max(seg, 1e-9)
-            return a + t * (b - a), True
-        cum += seg
-    return path_mm[-1], False                        # trace shorter than target
-
-
-def _fit_direction(path_mm, ostium_mm):
-    if len(path_mm) < 2:
-        return np.array([0.0, 0.0, 1.0])
-    pts = np.array(path_mm)
-    cen = pts - pts.mean(axis=0)
-    _, _, vv = np.linalg.svd(cen, full_matrices=False)
-    u = vv[0]
-    if np.dot(pts[-1] - ostium_mm, u) < 0:
-        u = -u
-    return u / max(np.linalg.norm(u), 1e-9)
-
-
-def _edt_radius_mm(edt_full, vox_zyx, ctx):
-    zz, yy, xx = [int(round(v)) for v in vox_zyx]
-    zz = np.clip(zz, 0, edt_full.shape[0] - 1)
-    yy = np.clip(yy, 0, edt_full.shape[1] - 1)
-    xx = np.clip(xx, 0, edt_full.shape[2] - 1)
-    return float(edt_full[zz, yy, xx])
-
-
-GEODESIC_HALF_WIDTH_MM = 5.0
-
-
-def _truncate_to_trace(comp, path_vox, ctx):
-    """daughters.nii.gz must hold only the traced proximal part, not the whole
-    grown component (which can extend well past a bifurcation or the 10mm cap).
-    Geodesic distance WITHIN the component from the trace, capped at a half-width
-    generous enough for the branch's own thickness (~5mm) but far short of
-    the remaining growth beyond a real fork -- so voxels past the truncation
-    point naturally fall outside the cap without needing a second marker set.
-    """
-    from skimage.graph import MCP_Geometric
-    cost = np.where(comp, 1.0, np.inf).astype(np.float64)
-    mcp = MCP_Geometric(cost, sampling=tuple(ctx.sp))
-    seeds = [list(p) for p in path_vox]
-    geo, _ = mcp.find_costs(seeds)
-    geo = np.nan_to_num(geo, nan=1e6, posinf=1e6)
-    return comp & (geo <= GEODESIC_HALF_WIDTH_MM)
-
-
-def _drop_end_caps(candidates, ctx, margin_mm=END_CAP_MARGIN_MM):
-    zs = np.where(ctx.mk.any(axis=(1, 2)))[0]
+def _drop_end_caps(case, cands):
+    """Step 8a. The flat cropped ends of the mask are not branch origins."""
+    zs = np.where(case.mk.any(axis=(1, 2)))[0]
     if not len(zs):
-        return candidates
-    zlo, zhi = zs[0] * ctx.sz, zs[-1] * ctx.sz
-    return [c for c in candidates
-            if (c["ostium_vox"][0] * ctx.sz - zlo) >= margin_mm
-            and (zhi - c["ostium_vox"][0] * ctx.sz) >= margin_mm]
+        return cands
+    sz = case.spacing[2]
+    zlo, zhi = zs[0] * sz, zs[-1] * sz
+    m = case.cfg.end_margin_mm
+    return [c for c in cands
+            if (c["ostium_vox"][0] * sz - zlo) >= m
+            and (zhi - c["ostium_vox"][0] * sz) >= m]
 
 
-def _dedupe(candidates, ctx, merge_mm=DEDUPE_MERGE_MM):
+def _dedupe(case, cands):
+    """Step 8b. Two ostia closer than 6 mm are one origin."""
     kept = []
-    for c in candidates:
-        p = np.asarray(c["ostium_vox"], float) * ctx.sp
-        if any(np.linalg.norm(p - np.asarray(k["ostium_vox"], float) * ctx.sp) < merge_mm
-               for k in kept):
+    for c in cands:
+        p = np.asarray(c["ostium_vox"], float) * case.sp
+        if any(np.linalg.norm(p - np.asarray(k["ostium_vox"], float) * case.sp)
+               < case.cfg.merge_mm for k in kept):
             continue
         kept.append(c)
     return kept
 
 
-def detect(img, ct, mk, spacing):
-    """Run the full frozen pipeline. Returns a list of candidate dicts with
-    voxel-space fields (ostium_vox, path_vox) plus physical-mm fields
-    (ostium_mm, seed_mm, radius_mm, direction_xyz) ready for output writers.
-    """
-    ctx = Ctx(img, ct, mk, spacing)
-    grown, n_leak = grow_expansion(ctx)
-    edt_full = ndi.distance_transform_edt(grown, sampling=tuple(ctx.sp)) if grown.any() \
-        else np.zeros_like(grown, float)
-
-    lab, keep = _components(grown, ctx)
-    candidates = []
-    for i in keep:
-        comp = lab == i
-        if ctx.min_reach_mm > 0 and float(ctx.dist_out[comp].max()) < ctx.min_reach_mm:
-            continue                                  # never leaves the wall
-
-        ostium_vox = _find_ostium(comp, ctx, edt_full)
-        if ostium_vox is None:
-            continue
-
-        origin_diam_mm = 2.0 * _edt_radius_mm(edt_full, ostium_vox, ctx)
-        if origin_diam_mm < MIN_ORIGIN_DIAM_MM:
-            continue                                  # origin too narrow to be eligible
-
-        path_vox = _trace_proximal(comp, ostium_vox, ctx)
-        path_mm = [ctx.to_mm_continuous(p) for p in path_vox]
-        ostium_mm = ctx.to_mm_continuous(ostium_vox)
-        seed_mm, _reached = _arc_length_point(path_mm, SEED_ARC_MM)
-        direction = _fit_direction(path_mm, ostium_mm)
-        seed_vox = ctx.mm_to_vox_continuous(seed_mm)   # same point as seed_mm, always
-        radius_mm = _edt_radius_mm(edt_full, seed_vox, ctx)
-
-        label_mask = _truncate_to_trace(comp, path_vox, ctx)
-
-        candidates.append(dict(
-            ostium_vox=ostium_vox, path_vox=path_vox,
-            ostium_mm=ostium_mm, seed_mm=seed_mm,
-            direction_xyz=direction, radius_mm=radius_mm,
-            origin_diam_mm=origin_diam_mm, component_id=i,
-            label_mask=label_mask, ctx_region=ctx.region,
-        ))
-
-    candidates = _drop_end_caps(candidates, ctx)
-    candidates = _dedupe(candidates, ctx)
-    for k, c in enumerate(candidates, start=1):
-        c["instance_id"] = f"branch_{k:03d}"
-    return candidates, ctx, grown, n_leak
+def detect(case):
+    """Run the frozen detector. Returns (component_labels, candidates, info)."""
+    grown, n_leak = _two_phase_growth(case)
+    lab, cands = _candidates(case, grown)
+    cands = _dedupe(case, _drop_end_caps(case, cands))
+    info = {
+        "lumen_mean_hu": round(case.mu, 1),
+        "lumen_sd_hu": round(case.sd, 1),
+        "band_hu": [round(case.lo, 1), round(case.hi, 1)],
+        "bone_cut_hu": round(case.bone_cut, 1),
+        "leaks_blocked": n_leak,
+        "grown_mL": round(float(grown.sum()) * case.vox_mm3 / 1000.0, 2),
+        "crop_shape": list(case.ct.shape),
+    }
+    return lab, cands, info

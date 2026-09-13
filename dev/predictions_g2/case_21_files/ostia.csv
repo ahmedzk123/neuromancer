@@ -1,0 +1,5 @@
+instance_id,label_value,parent_instance_id,ostium_x_mm,ostium_y_mm,ostium_z_mm,seed_x_mm,seed_y_mm,seed_z_mm,dir_x,dir_y,dir_z,radius_mm,origin_diameter_mm,centerline_length_mm,stopped_at_bifurcation
+branch_001,1,aorta,46.182,-156.818,383.0,50.157,-157.132,383.888,0.9459,0.2942,0.137,4.231,7.453,7.381,1
+branch_002,2,aorta,20.682,-168.818,413.0,21.461,-170.702,410.32,0.2798,-0.5653,-0.776,2.918,6.0,3.663,1
+branch_003,3,aorta,38.682,-153.818,407.0,41.818,-153.135,409.647,0.8113,0.156,0.5634,2.778,3.443,9.846,0
+branch_004,4,aorta,13.182,-159.818,401.0,11.736,-161.972,397.752,-0.3481,-0.5119,-0.7853,3.466,7.247,5.176,1
