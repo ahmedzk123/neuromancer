@@ -1,0 +1,6 @@
+TORALIS CHALLENGE/
+EVAL_SET/
+*.zip
+.venv/
+__pycache__/
+*.pyc

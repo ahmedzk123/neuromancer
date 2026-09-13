@@ -1,0 +1,5 @@
+# ITK-SNAP Label Description File
+# IDX R G B A VIS MSH LABEL
+0 0 0 0 0 0 0 "Background"
+1 230 25 75 1 1 1 "branch_001"
+2 60 180 75 1 1 1 "branch_002"
