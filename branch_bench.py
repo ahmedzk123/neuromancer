@@ -46,7 +46,7 @@ from matplotlib.colors import ListedColormap
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-__version__ = "2026-09-13.1"
+__version__ = "2026-09-13.2"
 
 CTA_LEVEL, CTA_WIDTH = 200.0, 700.0
 MASK_CMAP = ListedColormap([(0, 0, 0, 0), (1.0, 0.25, 0.25, 0.35)])
@@ -516,12 +516,29 @@ class Ctx:
         self.wall = (ndi.binary_dilation(self.mk, iterations=1)
                      & ~ndi.binary_erosion(self.mk, iterations=1))
         self.sp = np.array([sz, sy, sx])
+        # Direction matrix. Ignoring it puts marching-cubes surfaces in a
+        # MIRRORED position relative to points that went through
+        # TransformIndexToPhysicalPoint -- mesh and markers end up in different
+        # parts of the scene. Column j is the world direction of voxel axis j.
+        try:
+            self.D = np.array(img.GetDirection(), float).reshape(3, 3)
+        except Exception:
+            self.D = np.eye(3)
+        self.corner = None
 
         # aorta centreline: centroid per slice, for angles and radial geometry
         self.cl = {}
         for z in np.where(self.mk.any(axis=(1, 2)))[0]:
             cy, cx = ndi.center_of_mass(self.mk[z])
             self.cl[int(z)] = (cy, cx)
+
+    def verts_to_world(self, v):
+        """Marching-cubes vertices (mm from the crop corner, x/y/z) -> world mm."""
+        if v is None:
+            return None
+        if self.corner is None:
+            self.corner = self.to_mm((0, 0, 0))
+        return self.corner + np.asarray(v, float) @ self.D.T
 
     def to_mm(self, vox):
         """voxel (z, y, x) in the CROP -> physical (x, y, z) mm."""
@@ -1216,10 +1233,9 @@ def main():
 
     # ---- interactive ----
     meshes = []
-    off = ctx.to_mm((0, 0, 0))
     av, af = fine_surface(ctx.mk, ctx.spacing, cap=120_000)
     if av is not None:
-        meshes.append(dict(verts=av + off, faces=af, name="aorta",
+        meshes.append(dict(verts=ctx.verts_to_world(av), faces=af, name="aorta",
                            color="#d94a4a", opacity=0.3, text="parent aorta"))
     palette = ["#f2c14e", "#2f9e9e", "#7b6cd9", "#e07a5f", "#3fa34d",
                "#c85b9b", "#4f86c6", "#111111"]
@@ -1227,7 +1243,7 @@ def main():
         bv, bf = fine_surface(r.mask & ~ctx.mk, ctx.spacing, cap=90_000)
         if bv is None:
             continue
-        meshes.append(dict(verts=bv + off, faces=bf,
+        meshes.append(dict(verts=ctx.verts_to_world(bv), faces=bf,
                            name=f"{r.name} ({len(r.ostia_vox)} ostia)",
                            color=palette[k % len(palette)], opacity=0.9,
                            visible=(r.name.startswith("M8")),

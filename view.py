@@ -53,7 +53,7 @@ from scipy import ndimage as ndi
 # -----------------------------------------------------------------------------
 
 # Abdominal CT-angiography window. Contrast-filled aorta sits ~250-400 HU.
-__version__ = "2026-09-13.1"
+__version__ = "2026-09-13.2"
 
 CTA_LEVEL, CTA_WIDTH = 200.0, 700.0
 
@@ -1376,18 +1376,27 @@ def fig_frangi(ct, mk, spacing, out_png, out_txt, out_csv, case_id,
         # put vertices in (approximately) physical mm: crop offset + image origin.
         # Exact for axis-aligned volumes, which abdominal CT essentially always is.
         off = np.zeros(3)
+        D = np.eye(3)
         if img is not None:
             try:
                 off = np.array(img.TransformIndexToPhysicalPoint(
                     (int(x0), int(y0), int(z0))), dtype=float)
+                # Without the direction matrix the surfaces come out MIRRORED
+                # relative to points placed via TransformIndexToPhysicalPoint,
+                # so mesh and markers land in different parts of the scene.
+                D = np.array(img.GetDirection(), float).reshape(3, 3)
             except Exception:
-                off = np.zeros(3)
+                off, D = np.zeros(3), np.eye(3)
+
+        def to_world(v):
+            return None if v is None else off + np.asarray(v, float) @ D.T
+
         note = "" if img is not None else "  [relative]"
 
         meshes = []
         v, f = _surface(sub_mk, spacing, 1.2)
         if v is not None:
-            meshes.append(dict(verts=v + off, faces=f, name="aorta (supplied mask)",
+            meshes.append(dict(verts=to_world(v), faces=f, name="aorta (supplied mask)",
                                color="#d94a4a", opacity=0.35,
                                text="parent aorta<br>supplied mask"))
 
@@ -1413,7 +1422,7 @@ def fig_frangi(ct, mk, spacing, out_png, out_txt, out_csv, case_id,
                    f"centroid {pos}")
             linked = bool(r.get("axis_hits_aorta"))
             meshes.append(dict(
-                verts=v + off, faces=f,
+                verts=to_world(v), faces=f,
                 name=("* " if linked else "  ") + f"{r['candidate_id']}  "
                      f"(len {r['length_mm']:.0f}mm, travel {r['travel_ratio']}, "
                      f"r={r['radiality']:.2f})",
@@ -1433,8 +1442,8 @@ def fig_frangi(ct, mk, spacing, out_png, out_txt, out_csv, case_id,
             if ov is None:
                 continue
             o = (np.asarray(ov, float) * vox_mm)[[2, 1, 0]] + off
-            c = (np.asarray(r.get("_near_vox", r["_com_vox"]), float)
-                 * vox_mm)[[2, 1, 0]] + off
+            c = to_world((np.asarray(r.get("_near_vox", r["_com_vox"]), float)
+                          * vox_mm)[[2, 1, 0]])
             opts.append(o)
             olab.append(f"<b>{r['candidate_id']}</b> ostium<br>"
                         f"gap bridged {r['gap_to_wall_mm']} mm<br>"
@@ -1448,7 +1457,7 @@ def fig_frangi(ct, mk, spacing, out_png, out_txt, out_csv, case_id,
             bv, bf = fine_surface(bridges, spacing, cap=80_000)
             if bv is not None:
                 meshes.append(dict(
-                    verts=bv + off, faces=bf,
+                    verts=to_world(bv), faces=bf,
                     name=f"bridging lumen ({bridges.sum() * vox_mm3 / 1000:.2f} mL)",
                     color="#111111", opacity=0.9,
                     text="in-band voxels found between a candidate and the wall"))
